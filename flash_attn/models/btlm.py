@@ -1,17 +1,14 @@
 # Copyright (c) 2023, Tri Dao.
 
 import math
-import json
 import re
-from pathlib import Path
 
 from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
 
-from einops import rearrange
-from transformers import GPT2Config, AutoConfig, PretrainedConfig
+from transformers import GPT2Config, PretrainedConfig
 
 
 def remap_state_dict_hf_btlm(state_dict, config):
@@ -61,7 +58,7 @@ def remap_state_dict_hf_btlm(state_dict, config):
         state_dict[f"transformer.layers.{d}.mixer.Wqkv.weight"] = Wqkv.t()
         Wout = state_dict.pop(f"transformer.h.{d}.attn.c_proj.weight")
         state_dict[f"transformer.layers.{d}.mixer.out_proj.weight"] = Wout.t()
-    state_dict.pop(f"transformer.relative_pe.slopes")  # We don't store the Alibi slopes
+    state_dict.pop("transformer.relative_pe.slopes")  # We don't store the Alibi slopes
 
     def key_mapping_attn(key):
         key = re.sub(r"^transformer.h.(\d+).attn.c_attn.bias", r"transformer.layers.\1.mixer.Wqkv.bias", key)

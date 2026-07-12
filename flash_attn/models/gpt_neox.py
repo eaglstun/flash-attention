@@ -4,7 +4,6 @@ import math
 import re
 from collections import OrderedDict
 
-import torch
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import GPT2Config, GPTNeoXConfig
