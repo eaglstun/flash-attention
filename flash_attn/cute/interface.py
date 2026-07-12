@@ -9,59 +9,79 @@ from typing import Optional, Tuple, Callable
 
 import torch
 
-
-
-import cutlass
-import cutlass.cute as cute
-from cutlass import Int32, Float32
-from quack.compile_utils import make_fake_tensor as fake_tensor
-from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
 
+# The CuTe DSL kernel stack (cutlass, quack, and every flash_attn.cute kernel module)
+# is CUDA-only: nvidia-cutlass-dsl compiles to PTX and has no macOS/Metal target, and
+# its wheels are manylinux-only. Guard the whole import block so that
+# `import flash_attn.cute` still works on machines without the NVIDIA stack (e.g.
+# Apple Silicon). Any attempt to actually run these kernels without cutlass raises a
+# clear NotImplementedError in flash_attn_func / flash_attn_varlen_func (see
+# _check_cute_backend_available below and docs/apple_silicon/PORT_PLAN.md).
+try:
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32, Float32
+    from quack.compile_utils import make_fake_tensor as fake_tensor
+    from flash_attn.cute.cache_utils import get_jit_cache
 
-if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
-    from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
 
-    # Patch to dump ptx and then use system ptxas to compile to cubin
-    cute_dsl_ptxas.patch()
+    if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+        from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
+
+        # Patch to dump ptx and then use system ptxas to compile to cubin
+        cute_dsl_ptxas.patch()
 
 
-from flash_attn.cute import utils
-from flash_attn.cute import fa_logging
-from flash_attn.cute.cute_dsl_utils import (
-    get_aux_tensor_metadata,
-    get_broadcast_dims,
-    to_cute_aux_tensor,
-    to_cute_tensor,
-)
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
-from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
-from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
-from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
-from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
-from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
-from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
+    from flash_attn.cute import utils
+    from flash_attn.cute import fa_logging
+    from flash_attn.cute.cute_dsl_utils import (
+        get_aux_tensor_metadata,
+        get_broadcast_dims,
+        to_cute_aux_tensor,
+        to_cute_tensor,
+    )
+    from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+    from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+    from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+    from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+    from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+    from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+    from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+    from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+    from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
+    from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+    from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+    from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+    from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
+    from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
+    from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
-# SM100 head_dim=256 2CTA kernel imports
-from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
-from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
+    # SM100 head_dim=256 2CTA kernel imports
+    from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
+    from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
-from flash_attn.cute.utils import AuxData
-from flash_attn.cute.block_sparsity import (
-    BlockSparseTensorsTorch,
-    get_sparse_q_block_size,
-    to_cute_block_sparse_tensors,
-    normalize_block_sparse_config,
-    normalize_block_sparse_config_bwd,
-)
+    from flash_attn.cute.utils import AuxData
+    from flash_attn.cute.block_sparsity import (
+        BlockSparseTensorsTorch,
+        get_sparse_q_block_size,
+        to_cute_block_sparse_tensors,
+        normalize_block_sparse_config,
+        normalize_block_sparse_config_bwd,
+    )
+
+    CUTLASS_AVAILABLE = True
+except ImportError:
+    CUTLASS_AVAILABLE = False
+
+    # Placeholders for the few names this module references at import time
+    # (signature annotations and the compile-cache assignments). The kernel paths
+    # that use everything else are unreachable without cutlass — they are guarded
+    # by _check_cute_backend_available.
+    BlockSparseTensorsTorch = None
+
+    def get_jit_cache(name):
+        return {}
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -88,6 +108,19 @@ def _get_device_arch():
     arch_override = os.environ.get("FLASH_ATTENTION_ARCH", None)
     if arch_override is not None:
         return _parse_arch_str(arch_override)
+    if not torch.cuda.is_available():
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            raise NotImplementedError(
+                "flash_attn.cute: no CUDA device is available, and the MPS (Apple Silicon) "
+                "backend is not implemented yet (Phase 1 — see docs/apple_silicon/PORT_PLAN.md). "
+                "Set FLASH_ATTENTION_ARCH (e.g. 'sm_90') to select a kernel path for "
+                "CPU-only compilation."
+            )
+        raise RuntimeError(
+            "flash_attn.cute: no CUDA device is available and FLASH_ATTENTION_ARCH is not set. "
+            "Set FLASH_ATTENTION_ARCH (e.g. 'sm_90') to select a kernel path for "
+            "CPU-only compilation."
+        )
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + int(minor)
 
@@ -248,13 +281,39 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     if not is_fake_mode():
         assert t.is_cuda, f"{name} must be on CUDA"
 
-torch2cute_dtype_map = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
-}
+if CUTLASS_AVAILABLE:
+    torch2cute_dtype_map = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+    }
+else:
+    torch2cute_dtype_map = {}
+
+
+def _check_cute_backend_available(q: torch.Tensor) -> None:
+    """Raise a clear, actionable error when the CuTe kernel stack cannot serve this call.
+
+    flash_attn.cute kernels are CUDA-only (CuTe DSL compiles to PTX at runtime). On
+    machines without the NVIDIA stack — notably Apple Silicon — importing this module
+    is supported, but running attention is not (yet). See docs/apple_silicon/PORT_PLAN.md.
+    """
+    if q.device.type == "mps":
+        raise NotImplementedError(
+            "flash_attn.cute: the MPS (Apple Silicon) backend is not implemented yet. "
+            "The flash_attn.cute kernels are CUDA-only (CuTe DSL compiles to PTX at "
+            "runtime). A torch-based MPS path is planned for Phase 1 of the Apple "
+            "Silicon port — see docs/apple_silicon/PORT_PLAN.md."
+        )
+    if not CUTLASS_AVAILABLE:
+        raise NotImplementedError(
+            "flash_attn.cute: the CUDA kernel stack is unavailable ('cutlass' / 'quack' "
+            "are not installed; nvidia-cutlass-dsl ships Linux-only wheels), so attention "
+            f"cannot run on device '{q.device}'. On Apple Silicon, the MPS backend is "
+            "planned for Phase 1 — see docs/apple_silicon/PORT_PLAN.md."
+        )
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -2053,7 +2112,7 @@ def _flash_attn_bwd_sparse_mla(
     nheads_kv, head_dim_v = v.shape[-2:]
     qhead_per_kvhead = nheads // nheads_kv
     gather_kv_length = gather_kv_indices.shape[-1]
-    assert nheads_kv == 1 and qhead_per_kvhead == 128, f"sparse MLA bwd: only MQA 128 supported for now"
+    assert nheads_kv == 1 and qhead_per_kvhead == 128, "sparse MLA bwd: only MQA 128 supported for now"
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
     assert learnable_sink is None, "sparse MLA bwd: learnable sink not yet supported"
@@ -2743,6 +2802,7 @@ def flash_attn_func(
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
+    _check_cute_backend_available(q)
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2826,6 +2886,7 @@ def flash_attn_varlen_func(
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
     """
+    _check_cute_backend_available(q)
     return FlashAttnVarlenFunc.apply(
         q,
         k,

@@ -660,6 +660,10 @@ class CachedWheelsCommand(_bdist_wheel):
     def run(self):
         if FORCE_BUILD:
             return super().run()
+        if not IS_ROCM and torch.version.cuda is None:
+            # CPU-only / non-CUDA torch (e.g. macOS): there is no prebuilt CUDA wheel to
+            # fetch, and get_wheel_url() would fail parsing torch.version.cuda (None).
+            return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
         print("Guessing wheel URL: ", wheel_url)

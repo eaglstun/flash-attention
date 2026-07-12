@@ -1,27 +1,64 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 import os
 import warnings
 
 # isort: off
-# We need to import the CUDA kernels after importing torch
-USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
+# We need to import the CUDA kernels after importing torch.
+# Backend selection chain: ROCm/Triton -> CUDA (flash_attn_2_cuda) -> MPS -> clear error.
+# FLASH_ATTENTION_BACKEND={cuda,mps,triton} forces a specific backend and skips auto-detection.
+_BACKEND_OVERRIDE = os.getenv("FLASH_ATTENTION_BACKEND", "").strip().lower() or None
+if _BACKEND_OVERRIDE not in (None, "cuda", "mps", "triton"):
+    raise ValueError(
+        f"FLASH_ATTENTION_BACKEND={_BACKEND_OVERRIDE!r} is not valid; "
+        "expected one of 'cuda', 'mps', 'triton'"
+    )
+
+USE_TRITON_ROCM = (
+    os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+    or _BACKEND_OVERRIDE == "triton"
+)
+if not USE_TRITON_ROCM and _BACKEND_OVERRIDE is None and getattr(torch.version, 'hip', None) is not None:
     try:
         import flash_attn_2_cuda
     except ImportError:
         warnings.warn("flash_attn_2_cuda (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
         USE_TRITON_ROCM = True
 
+_USE_MPS_BACKEND = False
 if USE_TRITON_ROCM:
     from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
-else:
+elif _BACKEND_OVERRIDE == "cuda":
     import flash_attn_2_cuda as flash_attn_gpu
+elif _BACKEND_OVERRIDE == "mps":
+    import flash_attn.mps.fa2_backend as flash_attn_gpu
+    _USE_MPS_BACKEND = True
+else:
+    try:
+        import flash_attn_2_cuda as flash_attn_gpu
+    except ImportError as e:
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            # Apple Silicon: the CUDA extension cannot exist here. Route the five backend
+            # entry points (fwd / bwd / varlen_fwd / varlen_bwd / fwd_kvcache) to the MPS
+            # backend instead. See docs/apple_silicon/PORT_PLAN.md.
+            import flash_attn.mps.fa2_backend as flash_attn_gpu
+            _USE_MPS_BACKEND = True
+        else:
+            raise ImportError(
+                "flash_attn: could not import the CUDA extension 'flash_attn_2_cuda', and no "
+                "alternative backend is available on this machine "
+                "(torch.backends.mps.is_available() is False). On NVIDIA GPUs, install a "
+                "flash-attn build matching your torch/CUDA versions. Set "
+                "FLASH_ATTENTION_BACKEND={cuda,mps,triton} to force a specific backend."
+            ) from e
 
+# The torch custom ops below are registered per device type. Register them for MPS when
+# the MPS backend is selected so the torch dispatcher routes MPS tensors to this
+# implementation (instead of failing with a dispatcher error before reaching the backend).
+_custom_op_device_types = "mps" if _USE_MPS_BACKEND else "cuda"
 # isort: on
 
 def maybe_contiguous(x):
@@ -81,7 +118,7 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types=_custom_op_device_types)
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -150,7 +187,7 @@ else:
     _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_custom_op_device_types)
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -249,7 +286,7 @@ else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types=_custom_op_device_types)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -344,7 +381,7 @@ else:
     _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types=_custom_op_device_types)
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,

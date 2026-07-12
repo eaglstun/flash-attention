@@ -22,13 +22,17 @@ classifiers = [
 ]
 
 dependencies = [
-    "nvidia-cutlass-dsl==4.6.0.dev0",
+    # The CuTe DSL stack is Linux-only: nvidia-cutlass-dsl depends on
+    # nvidia-cutlass-dsl-libs-base, which ships manylinux-only wheels. On other
+    # platforms (e.g. macOS/Apple Silicon) the package installs without the kernel
+    # stack; flash_attn/cute/interface.py degrades to a clear NotImplementedError.
+    "nvidia-cutlass-dsl==4.6.0.dev0; sys_platform == 'linux'",
     "torch",
     "einops",
     "typing_extensions",
     "apache-tvm-ffi>=0.1.12,<0.2",
     "torch-c-dlpack-ext",
-    "quack-kernels>=0.5.3",
+    "quack-kernels>=0.5.3; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
