@@ -15,17 +15,33 @@ import torch
 
 from checks import check_tensor_budget
 from flash_attn.cute.testing import attention_ref
-from flash_attn.mps.core import _attention_forward
+from flash_attn.mps.core import _attention_forward, mps_flash_attn_func
 
 DEVICES = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
-# "eager" = the plain differentiable reference core (Phase 1b commit 1).
-IMPLS = ["eager"]
+# "eager" = the plain differentiable reference core.
+# "flash" = MPSFlashAttnFunc: chunked online-softmax forward under no_grad +
+#           recompute backward. Run here with chunk sizes small enough that
+#           every matrix seqlen actually crosses chunk boundaries (the
+#           defaults, 1024/256, would make most cases single-chunk);
+#           test_default_chunk_sizes covers the shipped defaults.
+IMPLS = ["eager", "flash"]
+FLASH_TEST_KV_CHUNK = 192
+FLASH_TEST_Q_CHUNK = 96
 
 
 def run_attention(impl, q, k, v, **kwargs):
     if impl == "eager":
         return _attention_forward(q, k, v, **kwargs)
+    if impl == "flash":
+        return mps_flash_attn_func(
+            q,
+            k,
+            v,
+            kv_chunk_size=FLASH_TEST_KV_CHUNK,
+            q_chunk_size=FLASH_TEST_Q_CHUNK,
+            **kwargs,
+        )
     raise ValueError(f"unknown impl {impl}")
 
 
@@ -351,13 +367,18 @@ def test_fully_masked_rows_no_nan(device, impl, dtype, case):
     assert torch.allclose(out.detach().float().cpu(), out_ref, atol=fwd_atol)
 
     # Cross-device self-consistency of the core (CPU run of the same impl).
+    # CPU and MPS fp32 matmuls reduce in different orders, so results stored
+    # in the test dtype can legitimately land a couple of ulp apart.
     if device != "cpu":
+        ulp = torch.finfo(dtype).eps
         out_c, lse_c, dq_c, dk_c, dv_c = run("cpu")
-        torch.testing.assert_close(out.cpu(), out_c)
-        torch.testing.assert_close(lse.cpu(), lse_c, equal_nan=False)
-        torch.testing.assert_close(dq.cpu(), dq_c)
-        torch.testing.assert_close(dk.cpu(), dk_c)
-        torch.testing.assert_close(dv.cpu(), dv_c)
+        torch.testing.assert_close(out.cpu(), out_c, rtol=4 * ulp, atol=4 * ulp)
+        torch.testing.assert_close(
+            lse.cpu(), lse_c, rtol=1e-5, atol=1e-5, equal_nan=False
+        )
+        torch.testing.assert_close(dq.cpu(), dq_c, rtol=4 * ulp, atol=4 * ulp)
+        torch.testing.assert_close(dk.cpu(), dk_c, rtol=4 * ulp, atol=4 * ulp)
+        torch.testing.assert_close(dv.cpu(), dv_c, rtol=4 * ulp, atol=4 * ulp)
 
     # A learnable sink rescues fully-masked rows: lse becomes the sink value.
     sink = torch.randn(nheads, dtype=torch.float32)
@@ -427,6 +448,106 @@ def test_custom_softmax_scale(device, impl, dtype):
     detail = f"custom_scale dev={device} impl={impl}"
     check_tensor_budget("out", out2, out_ref, out_pt, dtype, detail=detail)
     check_tensor_budget("lse", lse2, lse_ref, lse_pt, dtype, detail=detail)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp32", "fp16", "bf16"])
+def test_default_chunk_sizes(device, dtype):
+    """The shipped chunk defaults (kv 1024 fwd / q 256 bwd), on a seqlen long
+    enough to need several chunks of each, against the eager core."""
+    torch.manual_seed(8)
+    batch, sq, sk, nheads, d = 1, 2113, 2113, 4, 64
+    q_cpu = torch.randn(batch, sq, nheads, d).to(dtype)
+    k_cpu = torch.randn(batch, sk, nheads, d).to(dtype)
+    v_cpu = torch.randn(batch, sk, nheads, d).to(dtype)
+    g_cpu = torch.randn(batch, sq, nheads, d).to(dtype)
+
+    def run(fn, **kwargs):
+        q = q_cpu.detach().to(device).requires_grad_()
+        k = k_cpu.detach().to(device).requires_grad_()
+        v = v_cpu.detach().to(device).requires_grad_()
+        out, lse = fn(q, k, v, causal=True, **kwargs)
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), g_cpu.to(device))
+        return out, lse, dq, dk, dv
+
+    eager = run(_attention_forward)
+    flash = run(mps_flash_attn_func)  # default chunk sizes
+    # Both accumulate in fp32 but with different association (whole-matrix vs
+    # per-chunk), so values stored in the test dtype can differ by a few ulp
+    # (lse itself stays fp32).
+    # (the 1e-5 floor covers fp32 reassociation noise of length-2113 sums)
+    tol = max(8 * torch.finfo(dtype).eps, 1e-5)
+    for name, e, f in zip(["out", "lse", "dq", "dk", "dv"], eager, flash):
+        t = 1e-5 if name == "lse" else tol
+        torch.testing.assert_close(f, e, msg=lambda m: f"{name}: {m}", rtol=t, atol=t)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sdpa_fast_path(device, dtype, causal):
+    """return_lse=False + plain flags takes F.scaled_dot_product_attention;
+    it must return lse=None (never a fabricated one) and stay within the
+    same forward error budget as everything else."""
+    torch.manual_seed(9)
+    batch, sq, sk, nheads, nheads_kv, d = 4, 257, 257, 8, 2, 64
+    q_pt = torch.randn(batch, sq, nheads, d).to(dtype).requires_grad_()
+    k_pt = torch.randn(batch, sk, nheads_kv, d).to(dtype).requires_grad_()
+    v_pt = torch.randn(batch, sk, nheads_kv, d).to(dtype).requires_grad_()
+    if dtype == torch.float32:
+        refs = [t.detach().double().requires_grad_() for t in (q_pt, k_pt, v_pt)]
+        out_ref, _ = attention_ref(*refs, None, None, causal=causal, upcast=False)
+    else:
+        refs = [q_pt, k_pt, v_pt]
+        out_ref, _ = attention_ref(*refs, None, None, causal=causal)
+    out_pt, _ = attention_ref(
+        q_pt, k_pt, v_pt, None, None, causal=causal, upcast=False, reorder_ops=True
+    )
+    q = q_pt.detach().to(device).requires_grad_()
+    k = k_pt.detach().to(device).requires_grad_()
+    v = v_pt.detach().to(device).requires_grad_()
+    out, lse = mps_flash_attn_func(q, k, v, causal=causal, return_lse=False)
+    assert lse is None, "SDPA fast path must not fabricate an lse"
+    detail = f"sdpa causal={causal} dev={device}"
+    check_tensor_budget("out", out, out_ref, out_pt, dtype, detail=detail)
+    g = torch.randn(out_pt.shape).to(dtype)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), g.to(device))
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, refs, g.to(out_ref.dtype))
+    dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_pt, k_pt, v_pt), g)
+    check_tensor_budget("dq", dq, dq_ref, dq_pt, dtype, detail=detail)
+    check_tensor_budget("dk", dk, dk_ref, dk_pt, dtype, detail=detail)
+    check_tensor_budget("dv", dv, dv_ref, dv_pt, dtype, detail=detail)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_grad_through_lse(device):
+    """MPSFlashAttnFunc must propagate gradients that arrive through the lse
+    output (FA4's backward can pass dlse), matching plain autograd over the
+    eager core."""
+    torch.manual_seed(10)
+    dtype = torch.float32
+    batch, sq, sk, nheads, d = 2, 130, 174, 4, 64
+    q_cpu = torch.randn(batch, sq, nheads, d, dtype=dtype)
+    k_cpu = torch.randn(batch, sk, nheads, d, dtype=dtype)
+    v_cpu = torch.randn(batch, sk, nheads, d, dtype=dtype)
+    g_out = torch.randn(batch, sq, nheads, d, dtype=dtype)
+    g_lse = torch.randn(batch, nheads, sq, dtype=torch.float32)
+
+    def run(fn, **kwargs):
+        q = q_cpu.detach().to(device).requires_grad_()
+        k = k_cpu.detach().to(device).requires_grad_()
+        v = v_cpu.detach().to(device).requires_grad_()
+        out, lse = fn(q, k, v, causal=True, **kwargs)
+        return torch.autograd.grad(
+            (out, lse), (q, k, v), (g_out.to(device), g_lse.to(device))
+        )
+
+    eager = run(_attention_forward)
+    flash = run(mps_flash_attn_func, kv_chunk_size=64, q_chunk_size=48)
+    for name, e, f in zip(["dq", "dk", "dv"], eager, flash):
+        torch.testing.assert_close(
+            f, e, rtol=1e-4, atol=1e-4, msg=lambda m: f"{name}: {m}"
+        )
 
 
 @pytest.mark.parametrize("impl", IMPLS)
