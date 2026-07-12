@@ -7,7 +7,7 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 import math
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn.functional as F

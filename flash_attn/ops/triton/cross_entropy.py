@@ -1,6 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn.functional as F

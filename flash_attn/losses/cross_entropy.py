@@ -1,5 +1,6 @@
 # Copyright (c) 2024, Tri Dao.
 
+import torch
 import torch.nn as nn
 
 from flash_attn.ops.triton.cross_entropy import cross_entropy_loss

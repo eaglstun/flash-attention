@@ -1,11 +1,14 @@
 # Copyright (c) 2022, Tri Dao.
 # Inspired by / adapted from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+import math
 import re
 from collections import OrderedDict
+from copy import deepcopy
 from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from timm.models.helpers import named_apply
 from torch.nn.init import trunc_normal_

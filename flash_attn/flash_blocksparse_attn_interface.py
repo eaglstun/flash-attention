@@ -1,6 +1,7 @@
 # Adapted from https://github.com/mlcommons/training_results_v1.1/blob/main/NVIDIA/benchmarks/bert/implementations/pytorch/fmha.py
 import flash_attn_cuda
 import torch
+import torch.nn as nn
 
 
 def convert_blockmask(blockmask, causal):

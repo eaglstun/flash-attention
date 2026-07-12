@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import Tensor
+from torch.profiler import ProfilerActivity, profile, record_function
 
 try:
     from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput

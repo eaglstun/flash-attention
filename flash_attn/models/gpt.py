@@ -690,8 +690,8 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
                     state_dict[f"transformer.layers.{l}.norm1.bias"] = ln_bias
             ln_weight = state_dict.pop("transformer.ln_0.weight")
             ln_bias = state_dict.pop("transformer.ln_0.bias")
-            state_dict["transformer.layers.0.norm1.weight"] = ln_weight
-            state_dict["transformer.layers.0.norm1.bias"] = ln_bias
+            state_dict[f"transformer.layers.0.norm1.weight"] = ln_weight
+            state_dict[f"transformer.layers.0.norm1.bias"] = ln_bias
         return super().load_state_dict(state_dict, strict=strict)
 
 

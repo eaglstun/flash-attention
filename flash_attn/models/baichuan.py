@@ -1,14 +1,17 @@
 # Copyright (c) 2023, GGGGGGXY, Tri Dao.
 
 import math
+import json
 import re
+from pathlib import Path
 
 from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
 
-from transformers import GPT2Config, PretrainedConfig
+from einops import rearrange
+from transformers import GPT2Config, AutoConfig, PretrainedConfig
 
 
 def remap_state_dict_hf_baichuan(state_dict, config):

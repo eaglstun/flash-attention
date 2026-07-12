@@ -1,5 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import ProcessGroup

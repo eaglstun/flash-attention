@@ -10,6 +10,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Sequence
 from functools import partial
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
