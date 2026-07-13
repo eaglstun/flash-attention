@@ -58,6 +58,13 @@ else:
 # The torch custom ops below are registered per device type. Register them for MPS when
 # the MPS backend is selected so the torch dispatcher routes MPS tensors to this
 # implementation (instead of failing with a dispatcher error before reaching the backend).
+#
+# NOTE (MPS): the _wrapped_* aliases below bypass torch.ops.* on MPS and call the raw
+# Python implementations directly. torch.library.custom_op runs its backend impl below
+# the Autograd dispatch key, which silently disables autograd graph construction inside
+# the impl — and the MPS bwd/varlen_bwd are implemented as recompute +
+# torch.autograd.grad, which needs a live autograd. (Cost: no torch.compile capture of
+# these ops on MPS; eager semantics are identical.)
 _custom_op_device_types = "mps" if _USE_MPS_BACKEND else "cuda"
 # isort: on
 
@@ -118,7 +125,6 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types=_custom_op_device_types)
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -151,6 +157,11 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
+_flash_attn_forward_op = _torch_custom_op_wrapper(
+    "flash_attn::_flash_attn_forward", mutates_args=(), device_types=_custom_op_device_types
+)(_flash_attn_forward)
+
+
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
@@ -181,13 +192,12 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
+if torch.__version__ >= "2.4.0" and not _USE_MPS_BACKEND:
     _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_custom_op_device_types)
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -240,6 +250,11 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
+_flash_attn_varlen_forward_op = _torch_custom_op_wrapper(
+    "flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_custom_op_device_types
+)(_flash_attn_varlen_forward)
+
+
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_forward")
 def _flash_attn_varlen_forward_fake(
     q: torch.Tensor,
@@ -280,13 +295,12 @@ def _flash_attn_varlen_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
+if torch.__version__ >= "2.4.0" and not _USE_MPS_BACKEND:
     _wrapped_flash_attn_varlen_forward = torch.ops.flash_attn._flash_attn_varlen_forward
 else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types=_custom_op_device_types)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -338,6 +352,13 @@ def _flash_attn_backward(
     return softmax_d
 
 
+_flash_attn_backward_op = _torch_custom_op_wrapper(
+    "flash_attn::_flash_attn_backward",
+    mutates_args=("dq", "dk", "dv"),
+    device_types=_custom_op_device_types,
+)(_flash_attn_backward)
+
+
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
@@ -375,13 +396,12 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
+if torch.__version__ >= "2.4.0" and not _USE_MPS_BACKEND:
     _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
 else:
     _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types=_custom_op_device_types)
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -445,6 +465,13 @@ def _flash_attn_varlen_backward(
     return softmax_d
 
 
+_flash_attn_varlen_backward_op = _torch_custom_op_wrapper(
+    "flash_attn::_flash_attn_varlen_backward",
+    mutates_args=("dq", "dk", "dv"),
+    device_types=_custom_op_device_types,
+)(_flash_attn_varlen_backward)
+
+
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_backward")
 def _flash_attn_varlen_backward_fake(
     dout: torch.Tensor,
@@ -489,7 +516,7 @@ def _flash_attn_varlen_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
+if torch.__version__ >= "2.4.0" and not _USE_MPS_BACKEND:
     _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn._flash_attn_varlen_backward
 else:
     _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward

@@ -379,8 +379,14 @@ class MPSFlashAttnFunc(torch.autograd.Function):
         q_chunk_size = ctx.q_chunk_size
         if dout is None:  # only lse was used downstream
             dout = q.new_zeros((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]))
-        k_leaf = k.detach().requires_grad_()
-        v_leaf = v.detach().requires_grad_()
+        # fp32 leaves (fp16/bf16 -> fp32 is exact, so the recomputed forward is
+        # bit-identical): autograd.grad then returns per-chunk dK/dV in fp32,
+        # so the cross-chunk accumulation below is exact and dK/dV get rounded
+        # to the storage dtype exactly once, at the end. With low-precision
+        # leaves each chunk's gradient would be rounded to fp16/bf16 *before*
+        # accumulation, leaking chunk-boundary rounding into multi-chunk sums.
+        k_leaf = k.detach().float().requires_grad_()
+        v_leaf = v.detach().float().requires_grad_()
         dq_chunks = []
         dk_acc = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
         dv_acc = torch.zeros(v.shape, dtype=torch.float32, device=v.device)

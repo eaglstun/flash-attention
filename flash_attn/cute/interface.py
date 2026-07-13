@@ -111,10 +111,11 @@ def _get_device_arch():
     if not torch.cuda.is_available():
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             raise NotImplementedError(
-                "flash_attn.cute: no CUDA device is available, and the MPS (Apple Silicon) "
-                "backend is not implemented yet (Phase 1 — see docs/apple_silicon/PORT_PLAN.md). "
-                "Set FLASH_ATTENTION_ARCH (e.g. 'sm_90') to select a kernel path for "
-                "CPU-only compilation."
+                "flash_attn.cute: no CUDA device is available. On Apple Silicon, MPS "
+                "tensors are served by the torch-based backend through flash_attn_func / "
+                "flash_attn_varlen_func (see docs/apple_silicon/MPS_STATUS.md); the CuTe "
+                "kernel paths need a CUDA arch. Set FLASH_ATTENTION_ARCH (e.g. 'sm_90') "
+                "to select a kernel path for CPU-only compilation."
             )
         raise RuntimeError(
             "flash_attn.cute: no CUDA device is available and FLASH_ATTENTION_ARCH is not set. "
@@ -302,10 +303,10 @@ def _check_cute_backend_available(q: torch.Tensor) -> None:
     """
     if q.device.type == "mps":
         raise NotImplementedError(
-            "flash_attn.cute: the MPS (Apple Silicon) backend is not implemented yet. "
-            "The flash_attn.cute kernels are CUDA-only (CuTe DSL compiles to PTX at "
-            "runtime). A torch-based MPS path is planned for Phase 1 of the Apple "
-            "Silicon port — see docs/apple_silicon/PORT_PLAN.md."
+            "flash_attn.cute: this internal CuTe kernel path cannot run on MPS. On "
+            "Apple Silicon, MPS tensors are served by the torch-based backend through "
+            "the public flash_attn_func / flash_attn_varlen_func entry points only — "
+            "see docs/apple_silicon/MPS_STATUS.md."
         )
     if not CUTLASS_AVAILABLE:
         raise NotImplementedError(
@@ -2802,6 +2803,37 @@ def flash_attn_func(
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
+    if q.device.type == "mps":
+        # Apple Silicon: dispatch to the torch-based MPS core (differentiable, so
+        # autograd provides the backward — this branch sits above the
+        # autograd.Function on purpose). Same (out, lse) 2-tuple contract as the
+        # CUDA path; unsupported features raise NotImplementedError.
+        # See docs/apple_silicon/MPS_STATUS.md.
+        from flash_attn.mps.fa4_backend import fa4_mps_flash_attn_func
+
+        return fa4_mps_flash_attn_func(
+            q,
+            k,
+            v,
+            qv=qv,
+            gather_kv_indices=gather_kv_indices,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors,
+            block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+            return_lse=return_lse,
+        )
     _check_cute_backend_available(q)
     return FlashAttnFunc.apply(
         q,
@@ -2886,6 +2918,42 @@ def flash_attn_varlen_func(
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
     """
+    if q.device.type == "mps":
+        # Apple Silicon: dispatch to the torch-based MPS core (differentiable, so
+        # autograd provides the backward). Same (out, lse) 2-tuple contract as
+        # the CUDA path. See docs/apple_silicon/MPS_STATUS.md.
+        from flash_attn.mps.fa4_backend import fa4_mps_flash_attn_varlen_func
+
+        return fa4_mps_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            qv=qv,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_k=min_seqlen_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            gather_kv_indices=gather_kv_indices,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            deterministic=deterministic,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            return_lse=return_lse,
+        )
     _check_cute_backend_available(q)
     return FlashAttnVarlenFunc.apply(
         q,

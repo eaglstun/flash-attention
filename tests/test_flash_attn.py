@@ -1,4 +1,5 @@
 import math
+import os
 
 import pytest
 import torch
@@ -15,15 +16,38 @@ from flash_attn import (
 )
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
-from flash_attn.layers.rotary import apply_rotary_emb
+
+try:
+    from flash_attn.layers.rotary import apply_rotary_emb
+except ImportError:
+    # flash_attn.layers.rotary needs triton, which does not exist on e.g. Apple
+    # Silicon. Only the rotary-enabled kvcache tests need it; they fail with a
+    # clear error rather than the whole module failing to collect.
+    apply_rotary_emb = None
 
 MAX_HEADDIM_SM8x = 192
 
+# Device to run the tests on. The suite was written for CUDA; DEVICE="mps"
+# runs it against the torch-based Apple Silicon backend
+# (docs/apple_silicon/MPS_STATUS.md). All `device = DEVICE` sites below go
+# through this variable.
+DEVICE = os.getenv("FLASH_ATTN_TEST_DEVICE", "cuda")
 
-is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
-is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
-is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
-is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
+if torch.cuda.is_available():
+    is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
+    is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
+    is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
+    is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
+else:
+    is_sm75 = is_sm8x = is_sm80 = is_sm90 = False
+
+
+def gpu_memory_under_16gb():
+    """Original suite skipped big seqlens on <=16GB CUDA cards; other devices run them."""
+    return (
+        torch.cuda.is_available()
+        and gpu_memory_under_16gb()
+    )
 
 
 def attn_bias_from_alibi_slopes(
@@ -375,7 +399,7 @@ def generate_sparsity_mask(seqlen, sparsity=0.3):
     # mask = torch.stack([torch.tensor([1, 1] * repeats, dtype=torch.bool, device='cuda')], dim=-1)
     # mask = torch.stack([torch.tensor([1, 0] * repeats, dtype=torch.bool, device='cuda')], dim=-1)
     nrow, ncol = seqlen // 16, seqlen // 256
-    mask = torch.rand(nrow, ncol, device="cuda") < sparsity
+    mask = torch.rand(nrow, ncol, device=DEVICE) < sparsity
     return mask
 
 
@@ -584,9 +608,9 @@ def get_dropout_fraction(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
 def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
-    if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
+    if seqlen >= 2048 and gpu_memory_under_16gb():
         pytest.skip()  # Reference implementation OOM
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -733,9 +757,9 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 def test_flash_attn_varlen_qkvpacked(
     seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype
 ):
-    if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
+    if seqlen >= 2048 and gpu_memory_under_16gb():
         pytest.skip()  # Reference implementation OOM
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
@@ -905,12 +929,12 @@ def test_flash_attn_output(
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+        and gpu_memory_under_16gb()
     ):
         pytest.skip()  # Reference implementation OOM
     if softcap > 0.0 and dropout_p > 0.0:
         pytest.skip("Softcap and dropout not supported together")
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -1174,12 +1198,12 @@ def test_flash_attn_varlen_output(
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+        and gpu_memory_under_16gb()
     ):
         pytest.skip()  # Reference implementation OOM
     if softcap > 0.0 and dropout_p > 0.0:
         pytest.skip("Softcap and dropout not supported together")
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -1482,12 +1506,12 @@ def test_flash_attn_varlen_output(
 def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+        and gpu_memory_under_16gb()
     ):
         pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+    device = DEVICE
     causal = True
     # set seed
     torch.random.manual_seed(0)
@@ -1595,12 +1619,12 @@ def test_flash_attn_varlen_causal(
 ):
     if (
         max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+        and gpu_memory_under_16gb()
     ):
         pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+    device = DEVICE
     causal = True
     # set seed
     torch.random.manual_seed(0)
@@ -1767,7 +1791,7 @@ def test_flash_attn_splitkv(
 ):
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 1
@@ -1930,7 +1954,7 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
@@ -2197,7 +2221,7 @@ def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k,
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
 def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dtype):
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 60  # Sometimes we need large batch size for the race conditions to trigger
@@ -2248,14 +2272,14 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0.
     """
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
     nheads = 5
-    q = torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda") * 5
+    q = torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device=DEVICE) * 5
     k, v = [
-        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda") * 3
+        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device=DEVICE) * 3
         for _ in range(2)
     ]
     q.requires_grad_(True)
@@ -2304,18 +2328,18 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     """We previously had a bug where we were using the wrong strides of dout, which shows up
     when dout is not contiguous.
     """
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
     nheads = 2
     q, k, v = [
-        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda", requires_grad=True)
+        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device=DEVICE, requires_grad=True)
         for _ in range(3)
     ]
     out = rearrange(flash_attn_func(q, k, v, causal=causal), "b s ... -> s b ...")
     # So g is not contiguous
-    g = torch.randn(seqlen, 2 * batch_size, nheads, d, dtype=dtype, device="cuda")[:, ::2]
+    g = torch.randn(seqlen, 2 * batch_size, nheads, d, dtype=dtype, device=DEVICE)[:, ::2]
     out.backward(g)
     q_pt = q.detach().clone().requires_grad_(True)
     k_pt = k.detach().clone().requires_grad_(True)
@@ -2356,7 +2380,7 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0 or varlen.
     """
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     nheads = 5
@@ -2413,12 +2437,12 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
 def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+        and gpu_memory_under_16gb()
     ):
         pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -2471,12 +2495,12 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
 def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
     if (
         max(seqlen_q, seqlen_k) >= 2048
-        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
+        and gpu_memory_under_16gb()
     ):
         pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
@@ -2530,7 +2554,7 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
     """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 
-    device = "cuda"
+    device = DEVICE
     num_heads, num_heads_k, head_dim = 4, 2, 64
     page_block_size = 256
     scale = head_dim ** -0.5

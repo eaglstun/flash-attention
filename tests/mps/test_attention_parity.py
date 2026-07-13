@@ -568,3 +568,32 @@ def test_lse_convention_explicit(impl):
     assert lse.shape == (batch, nheads, sq)
     assert lse.dtype == torch.float32
     torch.testing.assert_close(lse, manual, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_bwd_chunk_accumulation_exact(device):
+    """dK/dV must be accumulated across Q-chunks in fp32 and rounded to the
+    storage dtype exactly once. With seqlen_k == 1 the softmax is the constant
+    1, so dq == 0 exactly and dv == sum of dout rows up to a single final
+    rounding (<= 1 ulp). Per-chunk fp16 rounding before accumulation — the bug
+    this pins — produced a 2+ ulp dv error, caught by
+    tests/test_flash_attn.py::test_flash_attn_splitkv[1-339-True-...-True-...]
+    on MPS."""
+    torch.manual_seed(11)
+    dtype = torch.float16
+    batch, sq, sk, nheads, d = 1, 339, 1, 12, 64
+    q = torch.randn(batch, sq, nheads, d, device=device).to(dtype).requires_grad_()
+    k = torch.randn(batch, sk, nheads, d, device=device).to(dtype).requires_grad_()
+    v = torch.randn(batch, sk, nheads, d, device=device).to(dtype).requires_grad_()
+    g = torch.randn(batch, sq, nheads, d, device=device).to(dtype)
+    out, _ = mps_flash_attn_func(q, k, v, q_chunk_size=96)  # several q chunks
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+    assert (dq == 0).all(), "single-key softmax is constant: dq must be exactly 0"
+    assert (dk == 0).all(), "single-key softmax is constant: dk must be exactly 0"
+    dv_exact = g.float().sum(dim=1, keepdim=True).to(dtype)
+    one_ulp = (dv_exact.abs().max() * torch.finfo(dtype).eps).item()
+    diff = (dv.float() - dv_exact.float()).abs().max().item()
+    assert diff <= 1.01 * one_ulp, (
+        f"dv must be accumulated in fp32 and rounded once: diff {diff:.5f} "
+        f"> 1 ulp ({one_ulp:.5f})"
+    )

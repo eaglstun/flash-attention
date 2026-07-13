@@ -1,0 +1,136 @@
+# FlashAttention on Apple Silicon (MPS) — Status
+
+**Phase 1 complete (correctness).** This is the honesty document: what works,
+what is degraded, what raises. An honest ❌ beats an optimistic ✅ that lies.
+
+## What this is
+
+A **second backend behind the frozen FlashAttention API**, written in plain
+differentiable PyTorch on MPS. It is **not** a port of the CUDA kernels — CuTe
+DSL has no Metal target, and `nvidia-cutlass-dsl` ships Linux-only wheels.
+There is exactly **one implementation of the attention math**
+(`flash_attn/mps/core.py`, fp32 accumulation everywhere, memory-bounded via
+KV-chunked online-softmax forward and Q-chunked recompute backward), verified
+against a CPU (and fp64) oracle by ~900 parity tests in `tests/mps/`. Both
+public seams are thin adapters over that core:
+
+| Seam                                    | Entry points                                                                                                            | Adapter                                                                                                                                         |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **FA2** — what third-party code imports | `from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_qkvpacked_func, …, flash_attn_with_kvcache` | `flash_attn/mps/fa2_backend.py` (implements the five-function `flash_attn_2_cuda` ABI: `fwd`, `bwd`, `varlen_fwd`, `varlen_bwd`, `fwd_kvcache`) |
+| **FA4** — the modern API                | `from flash_attn.cute import flash_attn_func, flash_attn_varlen_func`                                                   | `flash_attn/mps/fa4_backend.py` (dispatch above the autograd.Function; autograd provides the backward)                                          |
+
+**Correctness first; speed is Phase 2.** Nothing here is fused. If you need
+CUDA-class throughput today, this backend is not it — what it gives you is
+_correct numbers and correct gradients_ through the unmodified public API.
+
+## The one deliberate behavioral divergence: masked-row `lse`
+
+For rows whose keys are **all masked out** (e.g. causal with
+`seqlen_q > seqlen_k`, or a narrow sliding window), the two generations of
+CUDA kernels genuinely disagree, and each MPS seam matches _its own_
+generation:
+
+| API                                     | `lse` on fully-masked rows | Matches                                                           |
+| --------------------------------------- | -------------------------- | ----------------------------------------------------------------- |
+| FA2 (`flash_attn.flash_attn_interface`) | **`+inf`**                 | CUDA kernel, non-split path (`csrc/flash_attn/src/softmax.h:180`) |
+| FA4 (`flash_attn.cute`)                 | **`-inf`**                 | CuTe kernel (`flash_attn/cute/softmax.py:225`)                    |
+
+The core natively emits `-inf`; the FA2 adapter flips the sign. `out` is
+exactly `0` on those rows in both seams, gradients are exactly `0`, and no NaN
+appears anywhere, forward or backward. Pinned by
+`tests/mps/test_fa2_seam.py::test_fa2_lse_masked_rows_plus_inf` and
+`tests/mps/test_fa4_seam.py::test_fa4_lse_masked_rows_minus_inf`.
+
+## Feature matrix — FA2 seam (`from flash_attn import …`)
+
+✅ supported (parity-tested) · 🟡 degraded (correct but slow / caveats) · ❌ unsupported (raises `NotImplementedError`)
+
+| Feature                                                                                          | Status | Notes                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| forward, fp16 / bf16 / fp32                                                                      | ✅     | fp32 accumulation always; error budget ≤ the suite's own 2× in-dtype-torch bound                                                                                                                                                                                                                                                                                                     |
+| causal (bottom-right aligned), MHA / GQA / MQA                                                   | ✅     |                                                                                                                                                                                                                                                                                                                                                                                      |
+| **backward / training**                                                                          | 🟡     | correct gradients, but implemented as **recompute + autograd**, not a fused kernel: the backward re-runs the forward per Q-chunk. Expect roughly 2× the forward work of a fused implementation. `dq/dk/dv` are filled in place per the C-extension ABI, including through the packed variants' `dqkv[:, :, i]` views                                                                 |
+| sliding window / local attention (`window_size`)                                                 | ✅     | FA2 encoding (negative = infinite) translated at the seam                                                                                                                                                                                                                                                                                                                            |
+| softcap                                                                                          | ✅     |                                                                                                                                                                                                                                                                                                                                                                                      |
+| ALiBi (`alibi_slopes`, `(h,)` or `(b, h)`)                                                       | ✅     | for causal ALiBi the CUDA kernel uses a row-shifted bias; output and gradients are identical, `lse` differs by a per-row constant                                                                                                                                                                                                                                                    |
+| custom `softmax_scale`                                                                           | ✅     |                                                                                                                                                                                                                                                                                                                                                                                      |
+| head dims: anything ≥ 1 that fits memory                                                         | ✅     | no multiple-of-8 kernel constraint (the interface still pads to 8 before calling; harmless)                                                                                                                                                                                                                                                                                          |
+| **varlen** (`flash_attn_varlen_func`, `…_qkvpacked`, `…_kvpacked`)                               | 🟡     | **correct but slow**: implemented as a Python per-sequence loop around the dense core (one call per batch element), not a fused varlen kernel. `seqused_k` supported                                                                                                                                                                                                                 |
+| `flash_attn_with_kvcache` (append + attend, `cache_seqlens`, `cache_batch_idx`, `cache_leftpad`) | 🟡     | in-place cache append matches CUDA; per-batch Python loop (fine for decode-sized batches). No backward (same as CUDA)                                                                                                                                                                                                                                                                |
+| `deterministic`, `num_splits`, `zero_tensors`                                                    | ✅     | accepted and **ignored** — perf/legacy knobs, not semantics. (The math here is deterministic anyway.)                                                                                                                                                                                                                                                                                |
+| **dropout (`dropout_p > 0`)**                                                                    | ❌     | raises. FA2's dropout mask comes from the CUDA Philox RNG _inside_ the kernel and is reproduced from `rng_state` in the backward. That RNG cannot be bit-matched on MPS, and a torch-side mask that can't be reproduced exactly in the recompute-based backward would produce **silently wrong gradients** — the exact failure mode this port exists to prevent. Set `dropout_p=0.0` |
+| `return_attn_probs` / `S_dmask`                                                                  | ❌     | raises (only meaningful with dropout; the S_dmask encoding is kernel-internal)                                                                                                                                                                                                                                                                                                       |
+| paged KV cache (`block_table`)                                                                   | ❌     | raises                                                                                                                                                                                                                                                                                                                                                                               |
+| rotary embedding inside `fwd_kvcache` (`rotary_cos/sin`)                                         | ❌     | raises — apply rotary to q/k _before_ calling. (The in-repo rotary oracle needs triton, which doesn't exist on macOS)                                                                                                                                                                                                                                                                |
+| `leftpad_k` in `varlen_fwd`                                                                      | ❌     | raises (not reachable from the public API; `cache_leftpad` in kvcache **is** supported)                                                                                                                                                                                                                                                                                              |
+| `torch.compile` capture of the `flash_attn::*` custom ops                                        | ❌     | on MPS the interface calls the Python implementations directly, bypassing `torch.ops` — the custom-op layer runs its backend impl below the Autograd dispatch key, which breaks the recompute-based backward. Eager semantics are identical                                                                                                                                          |
+
+## Feature matrix — FA4 seam (`from flash_attn.cute import …`)
+
+| Feature                                                                                                                                                                                       | Status  | Notes                                                                             |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | --------------------------------------------------------------------------------- |
+| forward + backward, fp16 / bf16 / fp32                                                                                                                                                        | ✅ / 🟡 | same core, same caveat: backward is recompute + autograd, not fused               |
+| `(out, lse)` 2-tuple contract (also when `return_lse=False` → `(out, None)`)                                                                                                                  | ✅      |                                                                                   |
+| causal, GQA/MQA, `window_size` (None = infinite; genuinely negative windows honored; the `left + right < 0` collapse quirk reproduced via the interface's own `_resolve_causal_local_window`) | ✅      |                                                                                   |
+| softcap, `learnable_sink`, custom `softmax_scale`                                                                                                                                             | ✅      |                                                                                   |
+| gradients through `lse` (dlse)                                                                                                                                                                | ✅      | the dispatch sits above the autograd.Function; `MPSFlashAttnFunc` propagates dlse |
+| varlen: packed 3D + `cu_seqlens_{q,k}` (± `seqused_{q,k}` caps)                                                                                                                               | 🟡      | per-sequence Python loop — correct, slow. `lse` is `(nheads, total_q)`            |
+| varlen: batched 4D + `seqused_{q,k}`                                                                                                                                                          | 🟡      | rows past `seqused_q` are zero-filled with `lse = -inf`                           |
+| `num_splits`, `pack_gqa`, `deterministic`, `max_seqlen_*`, `min_seqlen_k`                                                                                                                     | ✅      | accepted and ignored (perf hints)                                                 |
+| `score_mod` / `mask_mod` / `aux_tensors` / `aux_scalars`                                                                                                                                      | ❌      | raises — these are **cute-typed JIT callables**; they cannot run on torch tensors |
+| block sparsity (`block_sparse_tensors*`)                                                                                                                                                      | ❌      | raises                                                                            |
+| paged KV (`page_table`)                                                                                                                                                                       | ❌      | raises                                                                            |
+| MLA (`qv`, hdim-512 absorption), `gather_kv_indices` / top-k                                                                                                                                  | ❌      | raises                                                                            |
+| fp8                                                                                                                                                                                           | ❌      | not applicable on MPS (no fp8 torch support); dtype never reaches the backend     |
+
+## Performance caveats, stated plainly
+
+- **Nothing is fused.** The forward is chunked torch matmuls with an online
+  softmax (memory-bounded, O(seqlen·chunk), so long sequences don't blow up
+  unified memory) — but each chunk is a separate dispatch.
+- **The backward recomputes.** Fused flash-attention also recomputes, but
+  inside one kernel; here it is a Python loop over Q-chunks, each doing a
+  forward + `torch.autograd.grad`. Training works and is exactly correct; it
+  is not fast.
+- **Varlen is a per-sequence Python loop.** Batch of 32 packed sequences =
+  32 core calls, forward and backward. Correct first; Phase 2 measures whether
+  it matters and what to do about it.
+- The **SDPA fast path** (`F.scaled_dot_product_attention`) is used only where
+  it is an _exact_ semantic match: plain/GQA attention, no lse requested,
+  causal only when `seqlen_q == seqlen_k` (SDPA's `is_causal` is top-left
+  aligned; flash-attention's is bottom-right).
+- **Dropout RNG will never bit-match CUDA.** Currently moot because dropout
+  raises, but if a future phase implements it, this line stays true.
+
+## Verification (how we know)
+
+- `tests/mps/test_attention_parity.py` — 790 core parity tests: CPU (fp32/fp64)
+  oracle vs the core, all dtypes × causal × GQA × head_dim × seqlen ×
+  window/softcap/ALiBi/sink, forward **and** backward, plus fully-masked-row
+  NaN hunts.
+- `tests/mps/test_fa2_seam.py`, `tests/mps/test_fa4_seam.py` — the seam
+  contracts above, through the real public entry points.
+- `tests/test_flash_attn.py` — the repo's own FA2 suite, run on MPS via
+  `FLASH_ATTN_TEST_DEVICE=mps` (the suite was made device-parametrizable; on
+  CUDA it is unchanged). Phase-1 run: a 1592-test dropout-free subset
+  (output/varlen_output/causal/varlen_causal/kvcache/splitkv/deterministic/
+  qkvpacked/bwd-corner-cases across seqlens 113–2048, d 64/128, fp16+bf16
+  slice) — all green. Structural exclusions, stated plainly:
+  - `dropout_p > 0` parametrizations raise `NotImplementedError` by design
+    (verified explicitly — they fail with the documented error, not wrong
+    numbers).
+  - rotary kvcache cases can't run: their oracle imports
+    `flash_attn.layers.rotary` → triton (Linux-only).
+  - `test_flash_attn_race_condition` was run only at small seqlens
+    ((1,239)/(239,1)/(97,97)/(128,128), d=64 — all passed): each case loops
+    250 fwd+bwd iterations at batch 60 to shake out CUDA races, which takes
+    hours on the unfused MPS backward at seqlen ≥ 512. The determinism
+    property it checks held everywhere it ran.
+
+## Not supported, not planned here
+
+- Making `flash_attn/cute/` CuTe kernels compile for Metal (impossible).
+- Bit-exact parity with CUDA kernels (different hardware, different reduction
+  order; parity is defined by the error-budget assertions above).
+- Speed. That is Phase 2 (benchmark torch-SDPA vs MLX vs
+  `metal-flash-attention` before writing any Metal).
