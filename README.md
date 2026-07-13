@@ -1,4 +1,5 @@
 # FlashAttention
+
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.
@@ -16,7 +17,6 @@ Paper: https://tridao.me/publications/flash2/flash2.pdf
 
 ![FlashAttention-2](assets/flashattention_logo.png)
 
-
 ## Usage
 
 We've been very happy to see FlashAttention being widely adopted in such a short
@@ -26,9 +26,9 @@ contains a partial list of places where FlashAttention is being used.
 FlashAttention and FlashAttention-2 are free to use and modify (see LICENSE).
 Please cite and credit FlashAttention if you use it.
 
-
 ## FlashAttention-3 beta release
-FlashAttention-3 is optimized for Hopper GPUs (e.g. H100). 
+
+FlashAttention-3 is optimized for Hopper GPUs (e.g. H100).
 
 Blogpost: https://tridao.me/blog/2024/flash3/
 
@@ -40,6 +40,7 @@ This is a beta release for testing / benchmarking before we integrate that with
 the rest of the repo.
 
 Currently released:
+
 - FP16 / BF16 forward and backward, FP8 forward
 
 Requirements: H100 / H800 GPU, CUDA >= 12.3.
@@ -47,16 +48,21 @@ Requirements: H100 / H800 GPU, CUDA >= 12.3.
 We highly recommend CUDA 12.8 for best performance.
 
 To install:
+
 ```sh
 cd hopper
 python setup.py install
 ```
+
 To run the test:
+
 ```sh
 export PYTHONPATH=$PWD
 pytest -q -s test_flash_attn.py
 ```
+
 Once the package is installed, you can import it as follows:
+
 ```python
 from flash_attn_3 import flash_attn_interface
 flash_attn_interface.flash_attn_func()
@@ -82,16 +88,19 @@ flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", subdirect
 FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GPUs (e.g. H100, B200).
 
 To install:
+
 ```sh
 pip install flash-attn-4
 ```
 
 If you're on CUDA 13, we recommend installing with the `cu13` extra for best performance:
+
 ```sh
 pip install "flash-attn-4[cu13]"
 ```
 
 Once installed, you can use it as follows:
+
 ```python
 from flash_attn.cute import flash_attn_func
 
@@ -99,12 +108,14 @@ out = flash_attn_func(q, k, v, causal=True)
 ```
 
 ## Installation and features
+
 **Requirements:**
+
 - CUDA toolkit or ROCm toolkit
 - PyTorch 2.2 and above.
 - `packaging` Python package (`pip install packaging`)
 - `psutil` Python package (`pip install psutil`)
-- `ninja` Python package (`pip install ninja`) *
+- `ninja` Python package (`pip install ninja`) \*
 - Linux. Might work for Windows starting v2.3.2 (we've seen a few positive [reports](https://github.com/Dao-AILab/flash-attention/issues/595)) but Windows compilation still requires more testing. If you have ideas on how to set up prebuilt CUDA wheels for Windows, please reach out via Github issue.
 
 \* Make sure that `ninja` is installed and that it works correctly (e.g. `ninja
@@ -115,10 +126,13 @@ compiling can take a very long time (2h) since it does not use multiple CPU
 cores. With `ninja` compiling takes 3-5 minutes on a 64-core machine using CUDA toolkit.
 
 **To install:**
+
 ```sh
 pip install flash-attn --no-build-isolation
 ```
+
 Alternatively you can compile from source:
+
 ```sh
 python setup.py install
 ```
@@ -127,6 +141,7 @@ If your machine has less than 96GB of RAM and lots of CPU cores, `ninja` might
 run too many parallel compilation jobs that could exhaust the amount of RAM. To
 limit the number of parallel compilation jobs, you can set the environment
 variable `MAX_JOBS`:
+
 ```sh
 MAX_JOBS=4 pip install flash-attn --no-build-isolation
 ```
@@ -134,7 +149,9 @@ MAX_JOBS=4 pip install flash-attn --no-build-isolation
 **Interface:** `src/flash_attention_interface.py`
 
 ### NVIDIA CUDA Support
+
 **Requirements:**
+
 - CUDA 12.0 and above.
 
 We recommend the
@@ -142,14 +159,61 @@ We recommend the
 container from Nvidia, which has all the required tools to install FlashAttention.
 
 FlashAttention-2 with CUDA currently supports:
+
 1. Ampere, Ada, or Hopper GPUs (e.g., A100, RTX 3090, RTX 4090, H100). For Turing GPUs (T4, RTX 2080), see the separate [flash-attention-turing](https://github.com/ssiu/flash-attention-turing) repo, which supports a core subset of FlashAttention features on Turing.
 2. Datatype fp16 and bf16 (bf16 requires Ampere, Ada, or Hopper GPUs).
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
+### Apple Silicon (Metal/MPS) Support
+
+> This is a fork-only feature, not present upstream.
+
+FlashAttention-2's Python API works on M-series Macs through a PyTorch/MPS backend. It is
+selected automatically when the CUDA extension is unavailable and MPS is (override with
+`FLASH_ATTENTION_BACKEND={cuda,mps,triton}`):
+
+```python
+import torch
+from flash_attn import flash_attn_func            # no CUDA required on macOS
+
+q, k, v = (torch.randn(2, 4096, 8, 64, dtype=torch.float16, device="mps") for _ in range(3))
+out = flash_attn_func(q, k, v, causal=True)       # forward and backward both work
+```
+
+**Requirements:** macOS on Apple Silicon, PyTorch with MPS. No CUDA toolkit, no `nvcc`, no
+compilation step.
+
+**What you get.** Attention is computed with PyTorch ops on the Metal backend rather than a
+fused kernel. Inference runs at roughly **1.05–1.15× the cost of raw
+`F.scaled_dot_product_attention`** — effectively the ceiling available to any torch-level
+implementation on this hardware. Training works and is memory-flat (the backward recomputes
+rather than storing the score matrix), which makes it the only path here that trains at 16k+
+context. Supported: causal, sliding-window/local, softcap, ALiBi, learnable sink, GQA/MQA,
+varlen, and the KV cache.
+
+**What is not supported** — these raise a clear `NotImplementedError` rather than returning
+wrong numbers: dropout (CUDA's Philox RNG cannot be bit-matched, and an unreproducible mask
+would silently corrupt the recompute backward), paged KV (`block_table`), rotary-in-KV-cache,
+`return_attn_probs`'s `S_dmask`, and `torch.compile` capture.
+
+**The FlashAttention-4 (`flash_attn.cute`) API also works on macOS** — `flash_attn_func` and
+`flash_attn_varlen_func` route to the same MPS backend and return the usual `(out, lse)`.
+What does _not_ exist on Apple Silicon is FA4's actual CuTeDSL machinery: those kernels
+compile to NVIDIA PTX, and `nvidia-cutlass-dsl` ships Linux-only wheels, so the FA4-specific
+features that live in the kernels (`score_mod`/`mask_mod`, block-sparsity, paged KV, MLA)
+raise `NotImplementedError`.
+
+Full feature matrix, benchmarks, and design notes: [`docs/apple_silicon/`](docs/apple_silicon/)
+— [`MPS_STATUS.md`](docs/apple_silicon/MPS_STATUS.md) (what works),
+[`BENCHMARKS.md`](docs/apple_silicon/BENCHMARKS.md) (numbers + methodology),
+[`PORT_PLAN.md`](docs/apple_silicon/PORT_PLAN.md) (how it was built).
+
 ### AMD ROCm Support
+
 ROCm version has two backends. There is [composable_kernel](https://github.com/ROCm/composable_kernel) (ck) which is the default backend and a [Triton](https://github.com/triton-lang/triton) backend. They provide an implementation of FlashAttention-2.
 
 **Requirements:**
+
 - ROCm 6.0 and above.
 
 We recommend the
@@ -157,23 +221,28 @@ We recommend the
 container from ROCm, which has all the required tools to install FlashAttention.
 
 #### Composable Kernel Backend
+
 FlashAttention-2 ROCm CK backend currently supports:
+
 1. MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs.
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
 
 #### Triton Backend
+
 The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
 
 The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/aiter) package, included as a git submodule at `third_party/aiter` and automatically installed during setup.
 
 To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
+
 ```sh
 cd flash-attention
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
 To use a specific aiter commit (e.g., for testing or development):
+
 ```sh
 cd flash-attention
 cd third_party/aiter && git fetch origin && git checkout <commit-sha> && cd ../..
@@ -181,6 +250,7 @@ FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
 To run the tests (note: full suite takes hours):
+
 ```sh
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
@@ -188,18 +258,20 @@ FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd
 The Triton backend uses a default kernel configuration optimized for determinism and reasonable performance across workloads. For peak throughput, enable `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"` to search for optimal settings, which incurs a one-time warmup cost.
 
 Alternativly, if _not_ autotuning, `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON` may be used to set a single triton config overriding the hardcoded defaults for `attn_fwd`. E.g.
+
 ```sh
 FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":128,"BLOCK_N":64,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":8}'
 ```
 
 For a quick start with Docker:
+
 ```dockerfile
 FROM rocm/pytorch:latest
 
 WORKDIR /workspace
 
 # build flash attention with triton backend
-RUN git clone https://github.com/Dao-AILab/flash-attention &&\ 
+RUN git clone https://github.com/Dao-AILab/flash-attention &&\
     cd flash-attention &&\
     FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 
@@ -211,6 +283,7 @@ ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 ```
 
 Build and run:
+
 ```sh
 docker build -t flash-attn-triton .
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri flash-attn-triton
@@ -218,8 +291,9 @@ docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE
 
 ## How to use FlashAttention
 
-The main functions implement scaled dot product attention (softmax(Q @ K^T *
+The main functions implement scaled dot product attention (softmax(Q @ K^T \*
 softmax_scale) @ V):
+
 ```python
 from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 ```
@@ -402,21 +476,26 @@ flash_attn_func = fa3_module.flash_attn_func
 ## Changelog
 
 ### 2.0: Complete rewrite, 2x faster
+
 Upgrading from FlashAttention (1.x) to FlashAttention-2
 
 These functions have been renamed:
+
 - `flash_attn_unpadded_func` -> `flash_attn_varlen_func`
 - `flash_attn_unpadded_qkvpacked_func` -> `flash_attn_varlen_qkvpacked_func`
 - `flash_attn_unpadded_kvpacked_func` -> `flash_attn_varlen_kvpacked_func`
 
 If the inputs have the same sequence lengths in the same batch, it is simpler
 and faster to use these functions:
+
 ```python
 flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False)
 ```
+
 ```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)
 ```
+
 ### 2.1: Change behavior of causal flag
 
 If seqlen_q != seqlen_k and causal=True, the causal mask is aligned to the
@@ -425,25 +504,25 @@ bottom right corner of the attention matrix, instead of the top-left corner.
 For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 =
 masked out) is:  
 v2.0:  
-    1 0 0 0 0  
-    1 1 0 0 0  
+ 1 0 0 0 0  
+ 1 1 0 0 0  
 v2.1:  
-    1 1 1 1 0  
-    1 1 1 1 1  
+ 1 1 1 1 0  
+ 1 1 1 1 1
 
 If seqlen_q = 5 and seqlen_k = 2, the causal mask is:  
 v2.0:  
-    1 0  
-    1 1  
-    1 1  
-    1 1  
-    1 1  
+ 1 0  
+ 1 1  
+ 1 1  
+ 1 1  
+ 1 1  
 v2.1:  
-    0 0  
-    0 0  
-    0 0  
-    1 0  
-    1 1  
+ 0 0  
+ 0 0  
+ 0 0  
+ 1 0  
+ 1 1  
 If the row of the mask is all zero, the output will be zero.
 
 ### 2.2: Optimize for inference
@@ -490,17 +569,19 @@ Thanks to @ani300 for this contribution.
 We present expected speedup (combined forward + backward pass) and memory savings from using FlashAttention against PyTorch standard attention, depending on sequence length, on different GPUs (speedup depends on memory bandwidth - we see more speedup on slower GPU memory).
 
 We currently have benchmarks for these GPUs:
-* [A100](#a100)
-* [H100](#h100)
-<!-- * [RTX 3090](#rtx-3090) -->
-<!-- * [T4](#t4) -->
+
+- [A100](#a100)
+- [H100](#h100)
+  <!-- * [RTX 3090](#rtx-3090) -->
+  <!-- * [T4](#t4) -->
 
 ### A100
 
 We display FlashAttention speedup using these parameters:
-* Head dimension 64 or 128, hidden dimension 2048 (i.e. either 32 or 16 heads).
-* Sequence length 512, 1k, 2k, 4k, 8k, 16k.
-* Batch size set to 16k / seqlen.
+
+- Head dimension 64 or 128, hidden dimension 2048 (i.e. either 32 or 16 heads).
+- Sequence length 512, 1k, 2k, 4k, 8k, 16k.
+- Batch size set to 16k / seqlen.
 
 #### Speedup
 
@@ -546,8 +627,8 @@ We also have an experimental implementation in Triton that support attention
 bias (e.g. ALiBi):
 https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 
-
 ## Tests
+
 We test that FlashAttention produces the same output and gradient as a reference
 implementation, up to some numerical tolerance. In particular, we check that the
 maximum numerical error of FlashAttention is at most twice the numerical error
@@ -555,9 +636,11 @@ of a baseline implementation in Pytorch (for different head dimensions, input
 dtype, sequence length, causal / non-causal).
 
 To run the tests:
+
 ```sh
 pytest -q -s tests/test_flash_attn.py
 ```
+
 ## When you encounter issues
 
 This new release of FlashAttention-2 has been tested on several GPT-style
@@ -566,13 +649,17 @@ models, mostly on A100 GPUs.
 If you encounter bugs, please open a GitHub Issue!
 
 ## Tests
+
 To run the tests:
+
 ```sh
 pytest tests/test_flash_attn_ck.py
 ```
 
 ## Citation
+
 If you use this codebase, or otherwise found our work valuable, please cite:
+
 ```
 @inproceedings{dao2022flashattention,
   title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
