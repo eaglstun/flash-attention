@@ -1,4 +1,11 @@
-# FlashAttention on Apple Silicon — Phase 2 Benchmarks
+# FlashAttention on Apple Silicon — Phase 2 Benchmarks · Phase 3a Results
+
+> **Phase 3a (2026-07-12) — the two batching wins, landed.** Work items 1
+> and 2 of the Phase 3 list below are done; the section
+> "[Phase 3a — measured results](#phase-3a--the-two-batching-wins-measured)"
+> at the end of this document has the before/after numbers and what they
+> honestly mean. Items 3-5 (lse fast path, SDPA-powered backward) are
+> Phase 3b and untouched.
 
 **Purpose:** decide what the Phase 3 fast path should be, with numbers. Phase 1
 (correctness) is done; nothing is fused. This document benchmarks the four
@@ -322,3 +329,98 @@ correctness surface beyond what the parity harness already pins.**
   TFLOP/s is a floor for what a fused kernel could do), and the backward is
   the hard, weeks-scale part — exactly the part MFA upstream doesn't solve
   for our feature set either.
+
+---
+
+## Phase 3a — the two batching wins, measured
+
+**Landed 2026-07-12** (branch `feature/apple-silicon-mps`). Scope: work items
+1 and 2 only — batch the kv-cache decode path and batch varlen. No lse fast
+path, no backward changes (Phase 3b). Same machine and methodology as above
+(`torch.mps.synchronize()` before and after every timed region; medians).
+All numbers reproducible with `benchmarks/mps/bench_varlen.py` (and
+`--skew` for the strategy sweep).
+
+### What changed
+
+- `flash_attn/mps/core.py`: the mask/ALiBi builders and both forwards accept
+  per-batch `seqused_q` / `seqused_k` / `key_leftpad` (padded-varlen /
+  kv-cache formulation, bottom-right diagonal aligned to each batch
+  element's _effective_ lengths); GQA in the chunked forward now uses
+  grouped einsums over native KV heads instead of `repeat_interleave`
+  copies (work item 5, forward half — it was load-bearing for the decode
+  win); score masking uses `torch.where` instead of `masked_fill`
+  (broadcast `masked_fill` is ~6x slower on MPS — measured, and it was most
+  of the first batched prototype's cost); a masked-SDPA fast path for
+  ragged shapes when no lse is demanded (boolean mask, fully-masked rows
+  forced to exact 0 with exact-0 grads).
+- `flash_attn/mps/fa2_backend.py::fwd_kvcache`: vectorized in-place cache
+  append (`index_put_`) + ONE batched masked attention call. No Python loop.
+- `flash_attn/mps/varlen.py`: pad -> one batched call -> repack by default,
+  per-sequence loop kept and auto-selected by a measured skew heuristic.
+
+### Headline before/after (the Phase 2 pathology table, re-run)
+
+Same script, same shapes, same machine; "before" re-measured on the Phase-2
+code immediately before the change, "after" is the final committed state.
+
+| workload (same shapes as Phase 2)                           | before (loop) | after (Phase 3a) | speedup  | raw batched-SDPA bound  |
+| ----------------------------------------------------------- | ------------- | ---------------- | -------- | ----------------------- |
+| kvcache decode, b=32, sq=1, cache 4096, 8/2 hd128           | 52.4 ms       | **6.8 ms**       | **7.7x** | 0.47 ms                 |
+| kvcache decode, same but ragged `cache_seqlens`             | (loop, 53 ms) | **5.9 ms**       | ~9x      | —                       |
+| varlen fwd, 32 packed seqs (64-1024 tok), causal, FA2 (lse) | 52.8 ms       | **45.2 ms**      | 1.2x     | 3.2 ms                  |
+| varlen fwd, same, no lse (FA4 `return_lse=False`)           | 3.4 ms¹       | **3.3 ms**       | 1.0x     | 3.2 ms                  |
+| varlen fwd+bwd, same, FA2 seam through autograd             | 227.9 ms      | **140.8 ms**     | **1.6x** | 79.5 ms (padded SDPA)   |
+| varlen fwd (lse), 256 seqs x 32 tokens (launch-bound)       | 66.5 ms       | **8.3 ms**       | **8.0x** | —                       |
+| varlen fwd (lse), 64 seqs x 128 tokens                      | 34.1 ms       | **6.4 ms**       | **5.3x** | —                       |
+| varlen fwd (lse), 512 seqs x 32 tokens                      | 132.9 ms      | **10.2 ms**      | **13x**  | —                       |
+| varlen fwd (lse), 1 x 8192 + 63 x 64 (extreme skew)         | 68 ms         | **68 ms** (loop) | 1.0x     | batched would be 15.6 s |
+
+¹ The Phase-1 loop already hit the per-sequence SDPA fast path when no lse
+was demanded; that case was never slow. The Phase-2 "18x" line compared the
+FA2 entry point (which must return lse) against raw SDPA (which cannot) —
+so part of that "18x" was never a batching gap at all.
+
+### Honest accounting vs the Phase 2 headroom
+
+- **Decode: 7.7x of the 123x, and the other 16x is not a batching problem.**
+  The loop is gone (one vectorized append + one batched attention call);
+  what remains is that `fwd_kvcache` must return `softmax_lse`, which SDPA
+  does not expose, so the attention itself still runs on the fp32 chunked
+  core (fp32 K/V traffic + manual online softmax) instead of Apple's fused
+  fp16 SDPA (0.47 ms). That last ~14x is exactly Phase 3b work item 3
+  (SDPA forward + a separate cheap lse pass), deliberately out of scope
+  here. Ragged `cache_seqlens` cost nothing extra — they are _faster_
+  (5.9 ms), because the batch's max post-append length is below the full
+  cache.
+- **Varlen: the "18x" number was mostly an lse problem wearing a batching
+  costume.** It compared the FA2 entry point (obliged to return lse, hence
+  the fp32 chunked core) against raw SDPA (which cannot return lse) — so
+  most of that gap was never reachable by batching. Batched: at the
+  Phase-2 benchmark shape the padded batch's wasted FLOPs nearly cancel the
+  loop's launch overhead in the lse forward (52.8 -> 45.2 ms, 1.2x). The
+  batching win is real and large exactly where launches dominate — **5-13x
+  for many-short-sequence batches** (64x128: 5.3x; 256x32: 8.0x; 512x32:
+  13x), which is the packed-training shape that motivates varlen in the
+  first place — and **1.6x on the FA2 fwd+bwd path** (227.9 -> 140.8 ms:
+  the recompute backward is now one masked-SDPA autograd call instead of
+  32). The rest of the gap to 3.2 ms is, again, lse -> Phase 3b.
+- **Skew is handled, not hidden.** A padded batch does `batch x max_len²`
+  work; at 1x8192+63x64 that is 15.6 _seconds_ vs the loop's 68 ms. The
+  driver picks per call with measured constants (three regimes documented
+  in `flash_attn/mps/varlen.py`; sweep: `bench_varlen.py --skew`), and the
+  extreme-skew row above shows the heuristic choosing the loop.
+
+### Correctness (nothing moved)
+
+`tests/mps/`: **911 passed** (890 pre-existing — zero tolerance changes,
+worst error-budget ratios unchanged including the documented
+`float32/lse = 1.0000` watch item — plus 21 new ragged/skew regression
+tests in `tests/mps/test_batched_paths.py`). Repo FA2 suite on MPS
+(`FLASH_ATTN_TEST_DEVICE=mps`): **14,180 passed**, dropout-free subset
+across `varlen_causal` (960), `causal` (960), `varlen_output` (1920),
+`output` (1152), `kvcache` (1920), `qkvpacked` (384), `varlen_qkvpacked`
+(1440), `deterministic` (960), `varlen_deterministic` (960), `splitkv`
+(3456), and the bwd corner cases (68) — every path this change touches,
+with zero failures. Padded/masked positions contribute exactly zero
+(forward and backward) by construction and by test.

@@ -1,13 +1,14 @@
-"""The known-pathological Phase 1 paths: varlen's per-sequence Python loop and
-the per-batch kvcache decode loop, quantified against batched alternatives.
+"""The (formerly) pathological paths: varlen and kvcache decode, quantified
+against raw batched-SDPA upper bounds.
 
-- varlen: ``flash_attn_varlen_func`` (FA2 seam) runs one core call per packed
-  sequence. Alternative measured: pad to a dense batch and run one batched
-  call (core, and torch SDPA) -- extra FLOPs on padding, but one launch.
-- decode: ``flash_attn_with_kvcache`` loops per batch element. Alternative:
-  one batched SDPA over the whole cache.
+Phase 1 shipped these as per-sequence/per-batch Python loops; Phase 3a
+batched them (docs/apple_silicon/BENCHMARKS.md). This script measures the
+public entry points (whatever strategy the driver picks) against the same
+alternatives as the Phase 2 survey, so before/after is apples-to-apples.
 
-Usage: PYTHONPATH=. python benchmarks/mps/bench_varlen.py
+Usage:
+    PYTHONPATH=. python benchmarks/mps/bench_varlen.py           # main table
+    PYTHONPATH=. python benchmarks/mps/bench_varlen.py --skew    # heuristic sweep
 """
 
 import sys
@@ -19,6 +20,7 @@ sys.path.insert(0, "benchmarks/mps")
 from common import median_iqr, sync, time_op  # noqa: E402
 
 from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache  # noqa: E402
+from flash_attn.mps.varlen import mps_flash_attn_varlen  # noqa: E402
 
 
 def bench(label, fn, **kw):
@@ -58,7 +60,7 @@ def varlen_bench():
                 q, k, v, cu_mps, cu_mps, max_len, max_len, causal=True
             )
 
-    bench("flash_attn_varlen_func fwd (per-seq loop)", varlen_fwd, budget_s=20)
+    bench("flash_attn_varlen_func fwd (auto strategy)", varlen_fwd, budget_s=20)
 
     def varlen_fwd_bwd():
         q.grad = k.grad = v.grad = None
@@ -68,11 +70,29 @@ def varlen_bench():
         out.backward(dout)
 
     bench(
-        "flash_attn_varlen_func fwd+bwd (per-seq loop)",
+        "flash_attn_varlen_func fwd+bwd (auto strategy)",
         varlen_fwd_bwd,
         warmup=2,
         iters=5,
         budget_s=60,
+    )
+
+    def varlen_fwd_nolse():
+        with torch.no_grad():
+            mps_flash_attn_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_mps,
+                cu_seqlens_k=cu_mps,
+                causal=True,
+                return_lse=False,
+            )
+
+    bench(
+        "varlen driver fwd, no lse (FA4 return_lse=False)",
+        varlen_fwd_nolse,
+        budget_s=20,
     )
 
     # padded-dense alternatives (upper bound on wasted FLOPs, one launch)
@@ -131,7 +151,7 @@ def decode_bench():
     def kvcache():
         flash_attn_with_kvcache(q, kc, vc, cache_seqlens=cache_seqlens, causal=True)
 
-    bench("flash_attn_with_kvcache (per-batch loop)", kvcache, budget_s=20)
+    bench("flash_attn_with_kvcache (batched)", kvcache, budget_s=20)
 
     def sdpa_decode():
         with torch.no_grad():
@@ -144,8 +164,69 @@ def decode_bench():
 
     bench("batched torch-SDPA decode (1 launch)", sdpa_decode, budget_s=20)
 
+    # ragged cache lengths (the case the batched masking has to earn)
+    torch.manual_seed(1)
+    ragged = torch.randint(64, cache_len, (b,), dtype=torch.int32, device="mps")
+
+    def kvcache_ragged():
+        flash_attn_with_kvcache(q, kc, vc, cache_seqlens=ragged, causal=True)
+
+    bench("flash_attn_with_kvcache, ragged cache_seqlens", kvcache_ragged, budget_s=20)
+
+
+def skew_bench():
+    """Batched-vs-looped sweep that calibrates the varlen strategy heuristic
+    (flash_attn/mps/varlen.py constants). Prints both forced strategies plus
+    what the heuristic actually picks."""
+    import random
+
+    random.seed(0)
+    cases = {
+        "32 x 64..1024 (ragged)": [random.randint(64, 1024) for _ in range(32)],
+        "64 x 128 (uniform small)": [128] * 64,
+        "256 x 32 (launch-bound)": [32] * 256,
+        "8 x 2048 (uniform large)": [2048] * 8,
+        "skew 1x4096 + 31x128": [4096] + [128] * 31,
+        "skew 1x8192 + 63x64": [8192] + [64] * 63,
+    }
+    for label, lens in cases.items():
+        lens_t = torch.tensor(lens)
+        total = int(lens_t.sum())
+        cu = torch.zeros(len(lens) + 1, dtype=torch.int32)
+        cu[1:] = lens_t.cumsum(0)
+        cu_mps = cu.to("mps")
+        torch.manual_seed(0)
+        q = torch.randn(total, 8, 64, device="mps", dtype=torch.float16)
+        k = torch.randn(total, 8, 64, device="mps", dtype=torch.float16)
+        v = torch.randn(total, 8, 64, device="mps", dtype=torch.float16)
+        print(f"\n== {label} (total={total}) ==")
+        for lse in (True, False):
+            for forced, name in (
+                (True, "batched"),
+                (False, "looped "),
+                (None, "auto   "),
+            ):
+
+                def run():
+                    with torch.no_grad():
+                        mps_flash_attn_varlen(
+                            q,
+                            k,
+                            v,
+                            cu_seqlens_q=cu_mps,
+                            cu_seqlens_k=cu_mps,
+                            causal=True,
+                            return_lse=lse,
+                            _force_batched=forced,
+                        )
+
+                bench(f"{'lse  ' if lse else 'nolse'} {name}", run, budget_s=25)
+
 
 if __name__ == "__main__":
     sync()
-    varlen_bench()
-    decode_bench()
+    if "--skew" in sys.argv:
+        skew_bench()
+    else:
+        varlen_bench()
+        decode_bench()

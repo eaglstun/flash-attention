@@ -400,6 +400,15 @@ def fwd_kvcache(
     (optional new tokens) are appended into ``k_cache``/``v_cache`` IN PLACE at
     ``cache_seqlens`` before attending. No backward (matches CUDA).
 
+    ONE batched launch sequence (Phase 3a): the append is a vectorized
+    ``index_put_`` and the attention is a single call into the KV-chunked core
+    with per-batch ``seqused_k``/``key_leftpad`` masking — no per-batch Python
+    loop. Ragged ``cache_seqlens`` are handled by slicing the cache to the
+    batch's max post-append length and hard-masking each row's tail (and
+    ``cache_leftpad`` head); the bottom-right causal/window diagonal aligns to
+    each batch element's *effective* cache length, exactly as if each sequence
+    had been sliced out and run alone.
+
     Returns:
         (out, softmax_lse)
         - out: (batch, seqlen_q, nheads, headdim), dtype of q
@@ -424,43 +433,50 @@ def fwd_kvcache(
     window = _window(window_size_left, window_size_right)
 
     with torch.no_grad():
-        outs = []
-        lses = []
-        for i in range(batch):
-            bi = int(cache_batch_idx[i]) if cache_batch_idx is not None else i
-            len_i = int(cache_seqlens[i]) if cache_seqlens is not None else seqlen_cache
-            if seqlen_new > 0:
-                assert len_i + seqlen_new <= seqlen_cache, (
-                    f"KV cache overflow: cache_seqlens[{i}]={len_i} + {seqlen_new} new "
-                    f"tokens > cache size {seqlen_cache}"
+        batch_idx = cache_batch_idx.long() if cache_batch_idx is not None else None
+        lens = (
+            cache_seqlens.long()
+            if cache_seqlens is not None
+            else torch.full((batch,), seqlen_cache, dtype=torch.long, device=q.device)
+        )
+        if seqlen_new > 0:
+            overflow = lens + seqlen_new > seqlen_cache
+            if bool(overflow.any()):
+                raise AssertionError(
+                    f"KV cache overflow: cache_seqlens={lens[overflow].tolist()} + {seqlen_new} "
+                    f"new tokens > cache size {seqlen_cache}"
                 )
-                k_cache[bi, len_i : len_i + seqlen_new].copy_(k[i])
-                v_cache[bi, len_i : len_i + seqlen_new].copy_(v[i])
-                len_i += seqlen_new
-            leftpad_i = int(cache_leftpad[i]) if cache_leftpad is not None else 0
-            k_i = k_cache[bi : bi + 1, leftpad_i:len_i]
-            v_i = v_cache[bi : bi + 1, leftpad_i:len_i]
-            slopes_i = alibi_slopes
-            if alibi_slopes is not None and alibi_slopes.dim() == 2:
-                slopes_i = alibi_slopes[i : i + 1]
-            if k_i.shape[1] == 0:
-                out_i = q.new_zeros((1, seqlen_q, nheads_q, head_dim_v))
-                lse_i = torch.full(
-                    (1, nheads_q, seqlen_q), _NEG_INF, dtype=torch.float32, device=q.device
-                )
-            else:
-                out_i, lse_i = _attention_forward_chunked(
-                    q[i : i + 1],
-                    k_i,
-                    v_i,
-                    softmax_scale=softmax_scale,
-                    causal=causal,
-                    window_size=window,
-                    softcap=softcap,
-                    alibi_slopes=slopes_i,
-                )
-            outs.append(out_i)
-            lses.append(lse_i)
-        out_c = torch.cat(outs, dim=0)
-        lse = _flip_lse_inf(torch.cat(lses, dim=0))
+            rows = batch_idx if batch_idx is not None else torch.arange(batch, device=q.device)
+            cols = lens.unsqueeze(1) + torch.arange(seqlen_new, device=q.device)  # (b, s_new)
+            k_cache.index_put_((rows.unsqueeze(1).expand_as(cols), cols), k)
+            v_cache.index_put_((rows.unsqueeze(1).expand_as(cols), cols), v)
+            lens = lens + seqlen_new
+        sk_max = int(lens.max()) if batch > 0 else 0
+        if sk_max == 0:
+            # Nothing visible anywhere: out = 0, lse = +inf (FA2 masked-row sign).
+            out_c = q.new_zeros((batch, seqlen_q, nheads_q, head_dim_v))
+            lse = torch.full(
+                (batch, nheads_q, seqlen_q), _INF, dtype=torch.float32, device=q.device
+            )
+            return _fill_out(out, out_c), lse
+        if batch_idx is not None:
+            k_eff = k_cache[batch_idx, :sk_max]
+            v_eff = v_cache[batch_idx, :sk_max]
+        else:
+            k_eff = k_cache[:, :sk_max]
+            v_eff = v_cache[:, :sk_max]
+        uniform_full = cache_leftpad is None and cache_seqlens is None and seqlen_new == 0
+        out_c, lse = _attention_forward_chunked(
+            q,
+            k_eff,
+            v_eff,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            seqused_k=None if uniform_full else lens,
+            key_leftpad=cache_leftpad.long() if cache_leftpad is not None else None,
+        )
+        lse = _flip_lse_inf(lse)
     return _fill_out(out, out_c), lse

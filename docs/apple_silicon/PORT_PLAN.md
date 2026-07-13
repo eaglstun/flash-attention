@@ -1,6 +1,6 @@
 # Apple Silicon Port — Plan of Attack
 
-**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ (see `BENCHMARKS.md` — recommendation: torch-SDPA-based fast path, no MLX, no Metal)** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
+**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ (see `BENCHMARKS.md` — recommendation: torch-SDPA-based fast path, no MLX, no Metal) · Phase 3a ✅ (batched kvcache decode + batched varlen; before/after in `BENCHMARKS.md` — decode **7.7×**, launch-bound varlen **5–13×**, FA2 varlen fwd+bwd **1.6×**; the remaining gap to the SDPA bound is the `lse` obligation, not batching → Phase 3b)** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
 
 > **Where we are (2026-07-12).** Attention works on Apple Silicon through _both_ public
 > APIs, forward and backward, verified against a CPU/fp64 oracle. `from flash_attn import
