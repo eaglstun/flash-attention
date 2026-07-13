@@ -1,6 +1,24 @@
 # Apple Silicon Port — Plan of Attack
 
-**Status:** planning · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
+**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 (benchmarking) is next** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
+
+> **Where we are (2026-07-12).** Attention works on Apple Silicon through _both_ public
+> APIs, forward and backward, verified against a CPU/fp64 oracle. `from flash_attn import
+flash_attn_func` — the import third-party code actually uses — runs on MPS. 888 parity
+> tests green, plus the repo's **own** FA2 suite (1591 tests, dropout-free subset) passing
+> on MPS. Feature matrix: `docs/apple_silicon/MPS_STATUS.md`. Nothing is fused yet; this is
+> correct, not fast. See Phase 2.
+>
+> **Watch items carried forward:**
+>
+> - `float32/lse` passes its error budget at a ratio of **exactly 1.0000** (`atol=0`, zero
+>   headroom). Not wrong, but brittle — if it ever goes red, look here first before
+>   assuming a real regression.
+> - On MPS the FA2 `_wrapped_*` aliases bind raw Python fns rather than `torch.ops.*`,
+>   because `torch.library.custom_op` runs below the Autograd key and breaks the recompute
+>   backward. Cost: **no `torch.compile` capture on MPS**. CUDA binding is unchanged.
+> - `bwd`/`varlen_bwd` fill `dq/dk/dv` **in place** — the FA2 caller reads those tensors and
+>   ignores all but `softmax_d` of the return. Break that and you get silently-zero grads.
 
 ## Scope (decided, do not re-litigate)
 
