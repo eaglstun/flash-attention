@@ -1,6 +1,6 @@
 # Apple Silicon Port — Plan of Attack
 
-**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 (benchmarking) is next** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
+**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ (see `BENCHMARKS.md` — recommendation: torch-SDPA-based fast path, no MLX, no Metal)** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
 
 > **Where we are (2026-07-12).** Attention works on Apple Silicon through _both_ public
 > APIs, forward and backward, verified against a CPU/fp64 oracle. `from flash_attn import
@@ -230,6 +230,15 @@ runs use):
    writing a single line of Metal.
 
 Deliverable: a numbers table and a recommendation. **The MLX question gets answered here, not before.**
+
+> **Done (2026-07-12).** `docs/apple_silicon/BENCHMARKS.md` has the numbers,
+> methodology, and the Phase 3 recommendation: build on torch MPS SDPA
+> (SDPA fwd + chunked lse, SDPA-powered chunked bwd, batched varlen/decode);
+> MLX rejected (fwd merely ties SDPA, bwd unfused O(L²) and bf16 grads fail
+> the error budget); MFA upstream unusable (single-head, no causal, Swift-only,
+> dormant). Benchmark harness lives in `benchmarks/mps/` and re-runs.
+> Landed here: `_Q_CHUNK_SIZE_BWD` 256→512 (4-9% bwd win), `enable_gqa` in
+> the SDPA fast path.
 
 ## Phase 3 — The fast path
 

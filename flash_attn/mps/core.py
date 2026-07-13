@@ -65,8 +65,12 @@ __all__ = [
 
 # Forward tiles the KV sequence; backward recomputes per tile of the Q
 # sequence. Both bound peak memory to O(seqlen * chunk) instead of O(seqlen^2).
+# Defaults set by the Phase 2 sweep (docs/apple_silicon/BENCHMARKS.md,
+# benchmarks/mps/bench_chunks.py): fwd latency is nearly flat in kv_chunk while
+# memory scales linearly, so 1024 stays; bwd q_chunk=512 is 4-9% faster than
+# 256 on M4 Max with flat-or-lower peak memory.
 _KV_CHUNK_SIZE_FWD = 1024
-_Q_CHUNK_SIZE_BWD = 256
+_Q_CHUNK_SIZE_BWD = 512
 
 
 def _build_score_mask(
@@ -470,6 +474,25 @@ def mps_flash_attn_func(
     )
     if not return_lse and plain_flags and (not causal or q.shape[1] == k.shape[1]):
         heads_per_kv = q.shape[2] // k.shape[2]
+        # enable_gqa lets SDPA broadcast KV heads internally instead of us
+        # materializing repeat_interleave copies (torch >= 2.5). MPS only:
+        # on CPU the grouped backward's dv accumulation order lands ~1.3x
+        # outside the fp32 parity budget (tests/mps test_sdpa_fast_path),
+        # so CPU keeps the materialized-copy path.
+        use_enable_gqa = heads_per_kv > 1 and q.device.type == "mps"
+        if use_enable_gqa:
+            try:
+                out = F.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    is_causal=causal,
+                    scale=softmax_scale,
+                    enable_gqa=True,
+                )
+                return out.transpose(1, 2).contiguous(), None
+            except TypeError:  # older torch: no enable_gqa kwarg
+                pass
         kf, vf = k, v
         if heads_per_kv > 1:
             kf = k.repeat_interleave(heads_per_kv, dim=2)
