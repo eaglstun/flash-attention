@@ -81,6 +81,19 @@ def _flip_lse_inf(lse):
     return lse.masked_fill_(lse == _NEG_INF, _INF)
 
 
+def _skipped_lse(q):
+    """Placeholder for a deliberately-uncomputed lse (``need_lse=False``).
+
+    A 0-element tensor, never a garbage-filled full-shape one: any consumer
+    that tries to read it fails loudly on shape, instead of silently using
+    wrong numbers. The FA2 interface only passes ``need_lse=False`` when it
+    has proven nothing can observe the lse (no backward will run and the
+    caller did not ask for it) — see ``_need_lse_kwargs`` in
+    ``flash_attn/flash_attn_interface.py``.
+    """
+    return torch.empty((0,), dtype=torch.float32, device=q.device)
+
+
 def _empty_aux(q):
     S_dmask = torch.empty((0,), dtype=q.dtype, device=q.device)
     rng_state = torch.zeros((2,), dtype=torch.int64, device=q.device)
@@ -134,15 +147,24 @@ def fwd(
     softcap,
     return_softmax,
     gen,
+    *,
+    need_lse=True,
 ):
     """Dense forward. Mirrors ``flash_attn_2_cuda.fwd``.
 
     Called from ``_flash_attn_forward`` (flash_attn_interface.py).
 
+    ``need_lse`` (keyword-only, MPS extension to the C-extension ABI): when
+    False, the interface has proven nothing can observe ``softmax_lse``
+    (Phase 3c) and the lse pass — which costs multiples of the fused SDPA
+    forward on MPS — is skipped; the lse slot is a 0-element placeholder.
+    Direct callers get the default True and always receive a real lse.
+
     Returns:
         (out, softmax_lse, S_dmask, rng_state)
         - out: (batch, seqlen_q, nheads, headdim), dtype of q
-        - softmax_lse: (batch, nheads, seqlen_q), float32, +inf on fully-masked rows
+        - softmax_lse: (batch, nheads, seqlen_q), float32, +inf on fully-masked
+          rows; 0-element fp32 placeholder when ``need_lse=False``
         - S_dmask: empty tensor (only meaningful with dropout, which raises)
         - rng_state: (2,) int64 dummy (dropout is unsupported)
     """
@@ -153,6 +175,7 @@ def fwd(
         # Split path (Phase 3b): SDPA computes out at Apple's fused speed and
         # a streaming fp32 pass computes the lse this ABI is obliged to
         # return; softcap/ALiBi fall back to the chunked core internally.
+        # need_lse=False (Phase 3c) rides the pure-SDPA fast path instead.
         out_c, lse = mps_flash_attn_func(
             q,
             k,
@@ -162,9 +185,9 @@ def fwd(
             window_size=_window(window_size_left, window_size_right),
             softcap=softcap,
             alibi_slopes=alibi_slopes,
-            return_lse=True,
+            return_lse=need_lse,
         )
-        lse = _flip_lse_inf(lse)
+        lse = _flip_lse_inf(lse) if need_lse else _skipped_lse(q)
     S_dmask, rng_state = _empty_aux(q)
     return _fill_out(out, out_c), lse, S_dmask, rng_state
 
@@ -192,6 +215,8 @@ def varlen_fwd(
     return_softmax,
     gen,
     num_splits,
+    *,
+    need_lse=True,
 ):
     """Variable-length forward. Mirrors ``flash_attn_2_cuda.varlen_fwd``.
 
@@ -199,10 +224,14 @@ def varlen_fwd(
     ``q``/``k``/``v`` are packed as (total_tokens, nheads, headdim) with boundaries
     given by ``cu_seqlens_q``/``cu_seqlens_k`` (int32, (batch + 1,)).
 
+    ``need_lse``: as in :func:`fwd` — keyword-only MPS extension; when False
+    the lse pass is skipped and a 0-element placeholder is returned.
+
     Returns:
         (out, softmax_lse, S_dmask, rng_state)
         - out: (total_q, nheads, headdim), dtype of q
-        - softmax_lse: (nheads, total_q), float32, +inf on fully-masked rows
+        - softmax_lse: (nheads, total_q), float32, +inf on fully-masked rows;
+          0-element fp32 placeholder when ``need_lse=False``
         - S_dmask, rng_state: as in ``fwd``
     """
     _check_dropout(dropout_p)
@@ -225,8 +254,9 @@ def varlen_fwd(
             window_size=_window(window_size_left, window_size_right),
             softcap=softcap,
             alibi_slopes=alibi_slopes,
+            return_lse=need_lse,
         )
-        lse = _flip_lse_inf(lse)
+        lse = _flip_lse_inf(lse) if need_lse else _skipped_lse(q)
     S_dmask, rng_state = _empty_aux(q)
     return _fill_out(out, out_c), lse, S_dmask, rng_state
 
@@ -396,6 +426,8 @@ def fwd_kvcache(
     softcap,
     rotary_interleaved,
     num_splits,
+    *,
+    need_lse=True,
 ):
     """Forward with KV cache (inference decode path). Mirrors
     ``flash_attn_2_cuda.fwd_kvcache``.
@@ -413,10 +445,17 @@ def fwd_kvcache(
     each batch element's *effective* cache length, exactly as if each sequence
     had been sliced out and run alone.
 
+    ``need_lse``: as in :func:`fwd` — keyword-only MPS extension; when False
+    (``flash_attn_with_kvcache`` without ``return_softmax_lse``, the common
+    decode call) the lse pass over the cache is skipped and a 0-element
+    placeholder is returned. There is no backward here (matches CUDA), so
+    the only possible lse consumer is ``return_softmax_lse=True``.
+
     Returns:
         (out, softmax_lse)
         - out: (batch, seqlen_q, nheads, headdim), dtype of q
-        - softmax_lse: (batch, nheads, seqlen_q), float32, +inf on fully-masked rows
+        - softmax_lse: (batch, nheads, seqlen_q), float32, +inf on fully-masked
+          rows; 0-element fp32 placeholder when ``need_lse=False``
     """
     if block_table is not None:
         _unsupported("paged KV cache (block_table)")
@@ -459,8 +498,10 @@ def fwd_kvcache(
         if sk_max == 0:
             # Nothing visible anywhere: out = 0, lse = +inf (FA2 masked-row sign).
             out_c = q.new_zeros((batch, seqlen_q, nheads_q, head_dim_v))
-            lse = torch.full(
-                (batch, nheads_q, seqlen_q), _INF, dtype=torch.float32, device=q.device
+            lse = (
+                torch.full((batch, nheads_q, seqlen_q), _INF, dtype=torch.float32, device=q.device)
+                if need_lse
+                else _skipped_lse(q)
             )
             return _fill_out(out, out_c), lse
         if batch_idx is not None:
@@ -472,7 +513,8 @@ def fwd_kvcache(
         uniform_full = cache_leftpad is None and cache_seqlens is None and seqlen_new == 0
         # Split path (Phase 3b): masked SDPA for out + streaming fp32 lse
         # pass over the effective cache; softcap/ALiBi fall back to the
-        # chunked core internally.
+        # chunked core internally. need_lse=False (Phase 3c) skips the lse
+        # pass — the remaining cost is one masked-SDPA call over the cache.
         out_c, lse = mps_flash_attn_func(
             q,
             k_eff,
@@ -484,7 +526,7 @@ def fwd_kvcache(
             alibi_slopes=alibi_slopes,
             seqused_k=None if uniform_full else lens,
             key_leftpad=cache_leftpad.long() if cache_leftpad is not None else None,
-            return_lse=True,
+            return_lse=need_lse,
         )
-        lse = _flip_lse_inf(lse)
+        lse = _flip_lse_inf(lse) if need_lse else _skipped_lse(q)
     return _fill_out(out, out_c), lse

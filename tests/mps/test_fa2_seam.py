@@ -417,3 +417,106 @@ def test_fa2_softmax_scale():
         q.to(DEVICE), k.to(DEVICE), v.to(DEVICE), softmax_scale=scale, causal=True
     )
     check_tensor_budget("out", out, out_ref, out_pt, dtype, detail="fa2 custom scale")
+
+
+def test_fa2_need_lse_gate(monkeypatch):
+    """Phase 3c: the lse pass runs iff something can observe softmax_lse.
+
+    The gate (flash_attn_interface._need_lse_kwargs) skips the streaming lse
+    pass exactly when no backward will run AND the caller did not ask for the
+    lse. Every observable-lse path must still produce the real thing:
+    return_attn_probs=True (which surfaces softmax_lse even with
+    dropout_p == 0), flash_attn_with_kvcache(return_softmax_lse=True), any
+    direct call into _flash_attn_forward / the backend ABI (third-party code,
+    e.g. ring attention, consumes softmax_lse from those), and training.
+    """
+    import flash_attn.mps.core as core
+    import flash_attn.mps.fa2_backend as fa2_backend
+    from flash_attn.flash_attn_interface import _flash_attn_forward
+    from flash_attn.mps.core import mps_flash_attn_func
+
+    calls = []
+    orig = core._lse_forward
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(core, "_lse_forward", spy)
+
+    torch.manual_seed(19)
+    dtype = torch.float16
+    batch, seqlen, h, d = 2, 128, 4, 64
+    q = torch.randn(batch, seqlen, h, d, device=DEVICE, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    # 1. Pure inference: no grad, lse not requested -> the pass is skipped.
+    with torch.no_grad():
+        out_plain = flash_attn_func(q, k, v, causal=True)
+    assert not calls, "inference (no grad, lse not requested) must skip the lse pass"
+
+    # ... including under no_grad with requires_grad leaves (no backward can run).
+    ql = q.clone().requires_grad_()
+    with torch.no_grad():
+        flash_attn_func(ql, k, v, causal=True)
+    assert not calls, "torch.no_grad() disables the backward; lse must be skipped"
+
+    # 2. return_attn_probs=True with dropout_p == 0: the interface returns
+    # softmax_lse to the user while calling the backend with
+    # return_softmax=False -> the lse MUST be computed and real.
+    with torch.no_grad():
+        out_probs, lse, _ = flash_attn_func(
+            q, k, v, causal=True, return_attn_probs=True
+        )
+    assert calls, "return_attn_probs=True (even with dropout_p == 0) must compute lse"
+    assert lse.shape == (batch, h, seqlen) and bool(torch.isfinite(lse).all())
+    torch.testing.assert_close(out_probs, out_plain, rtol=0, atol=0)
+    with torch.no_grad():
+        _, lse_ref = mps_flash_attn_func(q, k, v, causal=True, return_lse=True)
+    torch.testing.assert_close(lse, lse_ref, rtol=0, atol=0)
+
+    # 3. Training: grad enabled + an input requires grad -> lse is computed
+    # (saved for backward per the C-extension contract) and grads flow.
+    calls.clear()
+    qg, kg, vg = (x.clone().requires_grad_() for x in (q, k, v))
+    out = flash_attn_func(qg, kg, vg, causal=True)
+    assert calls, "training forward keeps computing lse (saved for backward)"
+    out.sum().backward()
+    assert qg.grad is not None and bool(qg.grad.abs().sum() > 0)
+
+    # 4. kvcache: no backward exists, so return_softmax_lse is the only consumer.
+    calls.clear()
+    with torch.no_grad():
+        out_kv = flash_attn_with_kvcache(q, k.clone(), v.clone(), causal=True)
+    assert not calls, "kvcache without return_softmax_lse must skip the lse pass"
+    with torch.no_grad():
+        out_kv2, lse_kv = flash_attn_with_kvcache(
+            q, k.clone(), v.clone(), causal=True, return_softmax_lse=True
+        )
+    assert calls and bool(torch.isfinite(lse_kv).all())
+    torch.testing.assert_close(out_kv2, out_kv, rtol=0, atol=0)
+
+    # 5. varlen inference skips too.
+    calls.clear()
+    cu = torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device=DEVICE)
+    qp = q.reshape(batch * seqlen, h, d)
+    kp = k.reshape(batch * seqlen, h, d)
+    vp = v.reshape(batch * seqlen, h, d)
+    with torch.no_grad():
+        flash_attn_varlen_func(qp, kp, vp, cu, cu, seqlen, seqlen, causal=True)
+    assert not calls, "varlen inference must skip the lse pass"
+
+    # 6. Direct (third-party-style) calls default to need_lse=True: a real lse.
+    calls.clear()
+    _, lse_direct, _, _ = _flash_attn_forward(
+        q, k, v, 0.0, d ** (-0.5), True, -1, -1, 0.0, None, False
+    )
+    assert calls, "direct _flash_attn_forward callers always get a real lse"
+    assert lse_direct.shape == (batch, h, seqlen)
+    calls.clear()
+    _, lse_abi, _, _ = fa2_backend.fwd(
+        q, k, v, None, None, 0.0, None, True, -1, -1, 0.0, False, None
+    )
+    assert calls, "direct backend-ABI callers always get a real lse"
+    assert lse_abi.shape == (batch, h, seqlen)

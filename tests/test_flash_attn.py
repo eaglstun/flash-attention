@@ -46,8 +46,37 @@ def gpu_memory_under_16gb():
     """Original suite skipped big seqlens on <=16GB CUDA cards; other devices run them."""
     return (
         torch.cuda.is_available()
-        and gpu_memory_under_16gb()
+        and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     )
+
+
+@pytest.fixture(autouse=True)
+def _mps_skip_unsupported(request):
+    """On MPS, features the backend does not support skip with a named reason
+    instead of erroring mid-test: the backend raises NotImplementedError for
+    dropout / paged KV / rotary-in-kvcache, and the tests' own reference code
+    can die even earlier (apply_rotary_emb is None on macOS — no triton).
+    On any other device this fixture is a no-op, so CUDA runs are unchanged.
+    See docs/apple_silicon/MPS_STATUS.md for the feature matrix.
+    """
+    if DEVICE != "mps":
+        return
+    callspec = getattr(request.node, "callspec", None)
+    params = callspec.params if callspec is not None else {}
+    if params.get("dropout_p", 0.0) > 0.0:
+        pytest.skip("MPS backend: dropout is unsupported (CUDA Philox RNG cannot be matched)")
+    if params.get("paged_kv_block_size") is not None:
+        pytest.skip("MPS backend: paged KV cache (block_table) is unsupported")
+    rotary_fraction = params.get("rotary_fraction", 0.0)
+    if rotary_fraction > 0.0:
+        d = params.get("d")
+        # rotary is only actually applied when rotary_dim > 0 (the test's own
+        # formula); when d is unknown, skip conservatively.
+        if d is None or math.floor(int(rotary_fraction * d) / 16) * 16 > 0:
+            pytest.skip(
+                "MPS backend: rotary embedding inside fwd_kvcache is unsupported "
+                "(apply_rotary_emb needs triton, which does not exist on macOS)"
+            )
 
 
 def attn_bias_from_alibi_slopes(
@@ -2552,6 +2581,8 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_flash_attn_varlen_paged_kv_num_splits(dtype):
     """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
+    if DEVICE == "mps":
+        pytest.skip("MPS backend: paged KV cache (block_table) is unsupported")
     from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 
     device = DEVICE

@@ -253,6 +253,19 @@ determinism. Scope that phase when we get there, not now.
 > `BENCHMARKS.md`; behavior/perf characterization: `MPS_STATUS.md`. What
 > remains beyond this is a genuine fused-Metal-kernel project (the
 > "when to reopen" section of `BENCHMARKS.md`), out of scope for this port.
+>
+> **Phase 3c (done 2026-07-13): don't compute the lse when nothing can read
+> it.** The FA2 seam now tells the backend whether `softmax_lse` is
+> observable (`_need_lse_kwargs`: a backward can run, or the caller asked
+> via `return_attn_probs=True` / `return_softmax_lse=True`); otherwise the
+> lse pass is skipped and the slot holds a 0-element placeholder (never
+> fabricated numbers). Public FA2 inference under `no_grad` went from
+> 6.7×/5.5× of raw SDPA to **1.15×/1.04×** (2k/8k, fp16 causal); decode
+> dropped to the batched-SDPA bound. Training is untouched (lse still
+> computed and saved). The FA4 seam already gated on `return_lse` and needed
+> nothing. Also Phase 3c: the FA2 suite skips unsupported features on MPS
+> (dropout / paged-KV / rotary-in-kvcache) with named reasons instead of
+> dying inside the tests' own reference code — CUDA collection unchanged.
 
 ---
 

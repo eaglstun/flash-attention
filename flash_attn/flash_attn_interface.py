@@ -125,6 +125,33 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
+def _need_lse_kwargs(is_grad: bool, return_softmax: bool) -> dict:
+    """MPS only (Phase 3c): tell the backend whether anything can ever read
+    ``softmax_lse``, so it can skip the lse pass — which costs multiples of
+    the entire fused attention forward on MPS (docs/apple_silicon/BENCHMARKS.md).
+
+    The lse is computed unless BOTH consumers are provably absent:
+
+    - ``is_grad`` False: no backward will run, so nothing is saved for it.
+      (When it IS saved, the MPS recompute backward never actually reads the
+      lse — but training keeps computing it anyway: conservative, and the
+      forward-cost there is amortized by the much larger backward.)
+    - ``return_softmax`` False: the *user's* ``return_attn_probs``. When True
+      the autograd Function returns ``(out, softmax_lse, S_dmask)`` to the
+      caller even with ``dropout_p == 0`` — in which case the backend itself
+      is called with ``return_softmax=False`` — so this must be the public
+      flag, NOT the ``return_softmax and dropout_p > 0`` value the backend
+      receives.
+
+    On CUDA this returns ``{}``: the op call and its schema are unchanged.
+    A skipped lse is a 0-element placeholder (see fa2_backend._skipped_lse),
+    never garbage values.
+    """
+    if _USE_MPS_BACKEND:
+        return {"need_lse": is_grad or return_softmax}
+    return {}
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -136,8 +163,13 @@ def _flash_attn_forward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
+    return_softmax: bool,
+    *,
+    need_lse: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # need_lse is a keyword-only, MPS-only perf hint (default True: direct
+    # callers always get a real softmax_lse). It is deliberately NOT part of
+    # the torch.ops custom-op schema — see _flash_attn_forward_op_impl.
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
@@ -153,13 +185,35 @@ def _flash_attn_forward(
         softcap,
         return_softmax,
         None,
+        **({"need_lse": need_lse} if _USE_MPS_BACKEND else {}),
     )
     return out, softmax_lse, S_dmask, rng_state
 
 
+def _flash_attn_forward_op_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    alibi_slopes: Optional[torch.Tensor],
+    return_softmax: bool
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Custom-op registration shim: keeps the torch.ops schema identical to
+    the pre-``need_lse`` op (no CUDA-visible signature change)."""
+    return _flash_attn_forward(
+        q, k, v, dropout_p, softmax_scale, causal,
+        window_size_left, window_size_right, softcap, alibi_slopes, return_softmax,
+    )
+
+
 _flash_attn_forward_op = _torch_custom_op_wrapper(
     "flash_attn::_flash_attn_forward", mutates_args=(), device_types=_custom_op_device_types
-)(_flash_attn_forward)
+)(_flash_attn_forward_op_impl)
 
 
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_forward")
@@ -219,7 +273,10 @@ def _flash_attn_varlen_forward(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
     num_splits: int = 0,
+    *,
+    need_lse: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # need_lse: keyword-only, MPS-only perf hint — see _flash_attn_forward.
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
         q,
@@ -244,15 +301,48 @@ def _flash_attn_varlen_forward(
         return_softmax,
         None,
         num_splits,
+        **({"need_lse": need_lse} if _USE_MPS_BACKEND else {}),
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
     return out, softmax_lse, S_dmask, rng_state
 
 
+def _flash_attn_varlen_forward_op_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    return_softmax: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    zero_tensors: bool = False,
+    num_splits: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Custom-op registration shim: keeps the torch.ops schema identical to
+    the pre-``need_lse`` op (no CUDA-visible signature change)."""
+    return _flash_attn_varlen_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        dropout_p, softmax_scale, causal, window_size_left, window_size_right,
+        softcap, alibi_slopes, return_softmax, block_table, leftpad_k,
+        seqused_k, zero_tensors, num_splits,
+    )
+
+
 _flash_attn_varlen_forward_op = _torch_custom_op_wrapper(
     "flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_custom_op_device_types
-)(_flash_attn_varlen_forward)
+)(_flash_attn_varlen_forward_op_impl)
 
 
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_forward")
@@ -558,6 +648,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            **_need_lse_kwargs(is_grad, return_softmax),
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -647,6 +738,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=None,
+            **_need_lse_kwargs(is_grad, return_softmax),
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
@@ -737,6 +829,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            **_need_lse_kwargs(is_grad, return_softmax),
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -833,6 +926,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=None,
+            **_need_lse_kwargs(is_grad, return_softmax),
         )
         if is_grad:
             ctx.save_for_backward(
@@ -928,6 +1022,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            **_need_lse_kwargs(is_grad, return_softmax),
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -1024,6 +1119,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            **_need_lse_kwargs(is_grad, return_softmax),
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1687,5 +1783,8 @@ def flash_attn_with_kvcache(
         softcap,
         rotary_interleaved,
         num_splits,
+        # No backward exists for fwd_kvcache (matches CUDA), so the only
+        # possible lse consumer is return_softmax_lse=True — is_grad=False.
+        **_need_lse_kwargs(False, return_softmax_lse),
     )
     return (out, softmax_lse) if return_softmax_lse else out

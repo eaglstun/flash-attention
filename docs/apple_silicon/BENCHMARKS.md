@@ -1,4 +1,4 @@
-# FlashAttention on Apple Silicon — Phase 2 Benchmarks · Phase 3a Results
+# FlashAttention on Apple Silicon — Phase 2 Benchmarks · Phase 3a/3b/3c Results
 
 > **Phase 3a (2026-07-12) — the two batching wins, landed.** Work items 1
 > and 2 of the Phase 3 list below are done; the section
@@ -467,7 +467,7 @@ same paths and reproduce the tables.
   2^30 score elements; past it the recompute backward takes over.
   **Before this, 16k-context training hard-crashed on MPS in every
   configuration** (`MPSGraph does not support tensor dims larger than
-  INT_MAX`) — reconfirmed on the Phase-3a code before the fix. Now:
+INT_MAX`) — reconfirmed on the Phase-3a code before the fix. Now:
   1x16384 h8 d64 FA2 fwd+bwd completes in 402 ms.
 - **fp32 dtype gate**: fp32 keeps the Phase-1 chunked/manual paths on the
   lse-producing and backward routes. Its parity budgets are ulp-referenced
@@ -486,17 +486,17 @@ same paths and reproduce the tables.
 
 ### Dense forward, `return_lse=True` (the FA2 `fwd` obligation) — fp16 causal
 
-| shape           | Phase 3a | Phase 3b    | speedup  | raw SDPA (no lse) | 3b / SDPA |
-| --------------- | -------- | ----------- | -------- | ----------------- | --------- |
-| 32x512 h8 d64   | 10.3 ms  | **6.9 ms**  | 1.5x     | 0.98 ms           | 7.1x      |
-| 16x1024 h8 d64  | 17.7 ms  | **10.7 ms** | 1.7x     | 1.59 ms           | 6.7x      |
-| 8x2048 h8 d64   | 33.5 ms  | **19.6 ms** | 1.7x     | 2.89 ms           | 6.8x      |
-| 4x4096 h8 d64   | 64.6 ms  | **38.2 ms** | 1.7x     | 5.52 ms           | 6.9x      |
-| 2x8192 h8 d64   | 128.4 ms | **60.0 ms** | 2.1x     | 10.70 ms          | 5.6x      |
-| 1x16384 h8 d64  | 254.7 ms | **103.9 ms**| 2.5x     | 21.37 ms          | 4.9x      |
-| 8x2048 h8 d128  | 41.6 ms  | **25.6 ms** | 1.6x     | 5.64 ms           | 4.5x      |
-| 8x2048 8/2 d64  | 33.0 ms  | **19.1 ms** | 1.7x     | 2.87 ms           | 6.7x      |
-| 1x16384 h8 d128 | 302.6 ms | **133.9 ms**| 2.3x     | 42.88 ms          | 3.1x      |
+| shape           | Phase 3a | Phase 3b     | speedup | raw SDPA (no lse) | 3b / SDPA |
+| --------------- | -------- | ------------ | ------- | ----------------- | --------- |
+| 32x512 h8 d64   | 10.3 ms  | **6.9 ms**   | 1.5x    | 0.98 ms           | 7.1x      |
+| 16x1024 h8 d64  | 17.7 ms  | **10.7 ms**  | 1.7x    | 1.59 ms           | 6.7x      |
+| 8x2048 h8 d64   | 33.5 ms  | **19.6 ms**  | 1.7x    | 2.89 ms           | 6.8x      |
+| 4x4096 h8 d64   | 64.6 ms  | **38.2 ms**  | 1.7x    | 5.52 ms           | 6.9x      |
+| 2x8192 h8 d64   | 128.4 ms | **60.0 ms**  | 2.1x    | 10.70 ms          | 5.6x      |
+| 1x16384 h8 d64  | 254.7 ms | **103.9 ms** | 2.5x    | 21.37 ms          | 4.9x      |
+| 8x2048 h8 d128  | 41.6 ms  | **25.6 ms**  | 1.6x    | 5.64 ms           | 4.5x      |
+| 8x2048 8/2 d64  | 33.0 ms  | **19.1 ms**  | 1.7x    | 2.87 ms           | 6.7x      |
+| 1x16384 h8 d128 | 302.6 ms | **133.9 ms** | 2.3x    | 42.88 ms          | 3.1x      |
 
 The honest sentence about the target: the goal was "within ~2x of raw
 SDPA"; the landing is **3-7x**. The residual is the fp32 lse pass itself —
@@ -510,15 +510,15 @@ reconstruct lse (a phantom-key trick was built, measured, and **rejected**:
 
 ### Dense forward+backward (training, lse path) — fp16 causal
 
-| shape           | Phase 3a  | Phase 3b     | speedup | vs Phase-2 core    |
-| --------------- | --------- | ------------ | ------- | ------------------ |
-| 32x512 h8 d64   | 44.4 ms   | **25.2 ms**  | 1.8x    | 52.6 -> 2.1x       |
-| 8x2048 h8 d64   | 157.4 ms  | **63.1 ms**  | 2.5x    | 216.7 -> 3.4x      |
-| 4x4096 h8 d64   | 311.1 ms  | **114.1 ms** | 2.7x    | 443.9 -> 3.9x      |
-| 2x8192 h8 d64   | 618.1 ms  | **203.6 ms** | 3.0x    | 868.9 -> 4.3x      |
-| 1x16384 h8 d64  | 1204.8 ms | **367.1 ms** | 3.3x    | 1739.1 -> 4.7x     |
-| 8x2048 h8 d128  | 191.6 ms  | **86.8 ms**  | 2.2x    | 311.6 -> 3.6x      |
-| 8x2048 8/2 d64  | 205.0 ms  | **89.4 ms**  | 2.3x    | (GQA inversion gone) |
+| shape          | Phase 3a  | Phase 3b     | speedup | vs Phase-2 core      |
+| -------------- | --------- | ------------ | ------- | -------------------- |
+| 32x512 h8 d64  | 44.4 ms   | **25.2 ms**  | 1.8x    | 52.6 -> 2.1x         |
+| 8x2048 h8 d64  | 157.4 ms  | **63.1 ms**  | 2.5x    | 216.7 -> 3.4x        |
+| 4x4096 h8 d64  | 311.1 ms  | **114.1 ms** | 2.7x    | 443.9 -> 3.9x        |
+| 2x8192 h8 d64  | 618.1 ms  | **203.6 ms** | 3.0x    | 868.9 -> 4.3x        |
+| 1x16384 h8 d64 | 1204.8 ms | **367.1 ms** | 3.3x    | 1739.1 -> 4.7x       |
+| 8x2048 h8 d128 | 191.6 ms  | **86.8 ms**  | 2.2x    | 311.6 -> 3.6x        |
+| 8x2048 8/2 d64 | 205.0 ms  | **89.4 ms**  | 2.3x    | (GQA inversion gone) |
 
 Memory stays flat (Q-chunked recompute) — this is the path that trains 16k+
 context where plain SDPA autograd cannot. FA2-seam roundtrip (fwd + explicit
@@ -539,14 +539,14 @@ ABI obliges us to produce every token.
 
 ### Varlen (strategy sweep highlights, fp16 causal, h8 d64)
 
-| workload                     | 3a (auto)   | 3b (auto)   | note                                    |
-| ---------------------------- | ----------- | ----------- | --------------------------------------- |
-| 32 x 64..1024 ragged, lse    | 45.2 ms     | **36.9 ms** | batched; K-truncation via global bound  |
-| 64 x 128 uniform, lse        | 6.4 ms      | **2.9 ms**  | batched via zero-copy reshape           |
-| 256 x 32 uniform, lse        | 8.3 ms      | **4.4 ms**  | batched via zero-copy reshape           |
-| 256 x 32 uniform, no lse     | —           | **0.96 ms** | was 8.8 ms batched at 3a                |
-| 8 x 2048 uniform, no lse     | 4.31 loop   | **3.7 ms**  | batched now wins (reshape, no gathers)  |
-| 1x8192 + 63x64 skew, lse     | 68 ms loop  | **45.9 ms** | loop (heuristic; batched would be ~25 s)|
+| workload                  | 3a (auto)  | 3b (auto)   | note                                     |
+| ------------------------- | ---------- | ----------- | ---------------------------------------- |
+| 32 x 64..1024 ragged, lse | 45.2 ms    | **36.9 ms** | batched; K-truncation via global bound   |
+| 64 x 128 uniform, lse     | 6.4 ms     | **2.9 ms**  | batched via zero-copy reshape            |
+| 256 x 32 uniform, lse     | 8.3 ms     | **4.4 ms**  | batched via zero-copy reshape            |
+| 256 x 32 uniform, no lse  | —          | **0.96 ms** | was 8.8 ms batched at 3a                 |
+| 8 x 2048 uniform, no lse  | 4.31 loop  | **3.7 ms**  | batched now wins (reshape, no gathers)   |
+| 1x8192 + 63x64 skew, lse  | 68 ms loop | **45.9 ms** | loop (heuristic; batched would be ~25 s) |
 
 ### Correctness (what the gates caught this phase)
 
@@ -556,7 +556,7 @@ ABI obliges us to produce every token.
   `float32/lse = 1.0000` watch-item ratio is unchanged, same worst case
   (it lives on the eager-impl grid, untouched by the split paths).
 - The parity grid rejected two would-be regressions during development,
-  exactly as designed: (1) a grouped-einsum GQA rewrite of the *reference*
+  exactly as designed: (1) a grouped-einsum GQA rewrite of the _reference_
   core moved fp32 MQA dk error to ~3x the in-dtype baseline — reverted
   (the perf-bearing paths use `enable_gqa` SDPA instead; the reference
   keeps the oracle's own repeat formulation); (2) SDPA-recompute for fp32
@@ -570,3 +570,100 @@ ABI obliges us to produce every token.
   values — the CUDA extension's pybind coerces anyway); the backend
   coerces at every entry (`_window_ints`) and pins the equivalence in
   `tests/mps/test_split_paths.py::test_tensor_window_sizes_match_ints`.
+
+## Phase 3c — don't compute the lse when nothing can read it, measured
+
+**Landed 2026-07-13** (branch `feature/apple-silicon-mps`). Same machine
+and methodology (sync before and after every timed region; medians;
+"before" measured on the committed Phase-3b code in this worktree
+immediately prior to the change). The after-numbers reproduce with the
+committed bench `benchmarks/mps/bench_fa2_inference.py` (which also
+re-asserts that every lse-observable path returns a real, finite lse);
+decode and varlen re-run with `benchmarks/mps/bench_varlen.py [--skew]`.
+
+### The observation
+
+Phase 3b made the mandatory `lse` cheap-er (a streaming fp32 pass instead
+of the whole chunked forward), but the FA2 ABI made it _mandatory_: `fwd`
+always returned an lse, so public FA2 **inference** under `torch.no_grad()`
+paid 5-7× a raw SDPA call for a tensor that — with no backward and no
+`return_attn_probs` — **nothing could ever read**.
+
+### What changed
+
+- The six FA2 autograd Functions and `flash_attn_with_kvcache` now pass a
+  keyword-only, MPS-only `need_lse` hint down to the backend
+  (`_need_lse_kwargs` in `flash_attn_interface.py`):
+  `need_lse = is_grad or return_softmax`, where `is_grad` is the
+  interface's own "will a backward run" bit (grad mode captured at the
+  public function + any input requires grad) and `return_softmax` is the
+  **user's** `return_attn_probs` — the public flag, not the
+  `return_softmax and dropout_p > 0` value the backend receives, because
+  `return_attn_probs=True` surfaces `softmax_lse` to the caller even with
+  `dropout_p == 0`. For kvcache the gate is `return_softmax_lse` alone
+  (no backward exists).
+- When `need_lse=False` the backend (`flash_attn/mps/fa2_backend.py`)
+  skips the lse pass entirely and puts a **0-element placeholder** in the
+  lse slot — never garbage values; any rogue reader fails loudly on shape.
+- On CUDA the kwarg dict is empty and the calls are unchanged; the
+  torch.ops custom-op schemas are pinned byte-identical by registration
+  shims (`_flash_attn_forward_op_impl`, `_flash_attn_varlen_forward_op_impl`).
+- Direct callers of `_flash_attn_forward` / `_flash_attn_varlen_forward` /
+  the backend ABI (ring-attention-style third-party code reads
+  `softmax_lse` from those) default to `need_lse=True`: real lse, always.
+- The FA4 seam already gated on `return_lse` and needed nothing.
+
+### Public FA2 inference under `torch.no_grad()` — fp16 causal, h8 d64
+
+| shape  | raw SDPA | 3b (before)      | 3c (after)           | before → after ratio |
+| ------ | -------- | ---------------- | -------------------- | -------------------- |
+| 8×2048 | 2.89 ms  | 19.21 ms (6.65×) | **3.32 ms (1.15×)**  | 5.8× faster          |
+| 2×8192 | 10.73 ms | 59.42 ms (5.54×) | **11.15 ms (1.04×)** | 5.3× faster          |
+
+Training (grad on, fwd+bwd, same shapes): 81.3→81.2 ms and 294.7→294.3 ms —
+**unchanged**, as designed (with grad enabled the lse is still computed and
+saved for the backward, exactly as before).
+
+### Decode (`flash_attn_with_kvcache`, b=32, sq=1, cache 4096, 8/2 hd128)
+
+| variant                 | Phase 2 | Phase 3a | Phase 3b | Phase 3c    |
+| ----------------------- | ------- | -------- | -------- | ----------- |
+| uniform `cache_seqlens` | 52.4 ms | 6.41 ms  | 3.71 ms  | **1.88 ms** |
+| ragged `cache_seqlens`  | ~53 ms  | 6.22 ms  | 4.10 ms  | **0.87 ms** |
+
+(raw batched-SDPA decode bound: 0.51 ms. `return_softmax_lse=True` still
+pays the 3b price, and still gets a real, verified lse.)
+
+### Varlen (public `flash_attn_varlen_func` fwd under no_grad, 32×64..1024 ragged, h8 d64)
+
+4.52 ms auto (was ~37 ms when the seam demanded lse unconditionally) — the
+driver now sees `return_lse=False` at inference and regime 2/3 of the
+Phase-3b heuristic applies unmodified. The `--skew` sweep was re-run in
+full: auto picks the winning strategy (or ties within noise) in every case,
+including both adversarial skews (batched there would be 384 ms / 22 s;
+auto loops at 12.7 / 45.3 ms with lse, 3.1 / 8.9 ms without). **No
+constants needed retuning.**
+
+### The exactness argument (why no fabricated lse can escape)
+
+`softmax_lse` from the dense/varlen forward is observable in exactly two
+ways: (1) returned to the user when `return_attn_probs=True` — gate keeps
+`need_lse=True`; (2) saved for backward and passed to `bwd`/`varlen_bwd` —
+gate keeps `need_lse=True` whenever a backward can run (and the MPS
+recompute backward ignores the lse anyway). From `fwd_kvcache` it is
+observable only via `return_softmax_lse=True` — gated on precisely that.
+Everything else receives a bare `out`; the skipped-lse slot is a 0-element
+tensor, so any unforeseen reader crashes on shape instead of consuming
+wrong numbers. Pinned by
+`tests/mps/test_fa2_seam.py::test_fa2_need_lse_gate` (skips at inference,
+computes when observable, real values equal to the always-computed path,
+defaults preserved for direct/third-party callers).
+
+### Test-suite hygiene (Task 2 of this phase)
+
+`tests/test_flash_attn.py` now skips unsupported features on MPS with a
+named reason (autouse fixture, no-op on CUDA): dropout (the backend raises
+by design), paged-KV `block_table` (raises), rotary-in-kvcache (the test's
+own oracle needs triton). Deterministic 1500-test random sample of the
+508,774-test suite (seed 1337): **479 passed, 1021 skipped
+(271 dropout + 435 paged-KV + 315 rotary), 0 failed, 100 s.**
