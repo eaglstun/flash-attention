@@ -1,6 +1,6 @@
 # Apple Silicon Port — Plan of Attack
 
-**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ (see `BENCHMARKS.md` — recommendation: torch-SDPA-based fast path, no MLX, no Metal) · Phase 3a ✅ (batched kvcache decode + batched varlen; before/after in `BENCHMARKS.md` — decode **7.7×**, launch-bound varlen **5–13×**, FA2 varlen fwd+bwd **1.6×**; the remaining gap to the SDPA bound is the `lse` obligation, not batching → Phase 3b)** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
+**Status:** **Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅ (see `BENCHMARKS.md` — recommendation: torch-SDPA-based fast path, no MLX, no Metal) · Phase 3a ✅ (batched kvcache decode + batched varlen) · Phase 3b ✅ (split forward: SDPA `out` + streaming fp32 lse; SDPA-powered Q-chunked recompute backward; INT_MAX guard — before/after in `BENCHMARKS.md`: lse-demanding dense fwd **1.5–2.5×** (lands 3–7× of raw SDPA, from 6–25×), dense fwd+bwd **1.8–3.3×**, decode 6.4→3.7 ms, 16k training no longer crashes; fp32 deliberately keeps the Phase-1 paths on lse/backward routes — see `MPS_STATUS.md`)** · **Scope locked with Eric 2026-07-12** · **Fork:** `eaglstun/flash-attention`
 
 > **Where we are (2026-07-12).** Attention works on Apple Silicon through _both_ public
 > APIs, forward and backward, verified against a CPU/fp64 oracle. `from flash_attn import
@@ -246,6 +246,13 @@ Whichever Phase 2 picks. If it's hand-written MSL, it's the bitsandbytes shape (
 `.metal`, own `.metallib`, packaged via package-data glob so it survives `pip install`) and
 the backward pass is where it gets genuinely hard — dQ/dK/dV recompute, atomics,
 determinism. Scope that phase when we get there, not now.
+
+> **Done (2026-07-13).** Phase 3a (batching) and Phase 3b (the lse split +
+> SDPA-powered backward) landed the whole Phase-2 work list on torch SDPA —
+> zero new dependencies, zero Metal. Numbers and honest accounting:
+> `BENCHMARKS.md`; behavior/perf characterization: `MPS_STATUS.md`. What
+> remains beyond this is a genuine fused-Metal-kernel project (the
+> "when to reopen" section of `BENCHMARKS.md`), out of scope for this port.
 
 ---
 

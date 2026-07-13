@@ -44,7 +44,7 @@ Perf-only knobs (``num_splits``, ``deterministic``, ``zero_tensors``,
 
 import torch
 
-from flash_attn.mps.core import _attention_forward_chunked, mps_flash_attn_func
+from flash_attn.mps.core import mps_flash_attn_func
 from flash_attn.mps.varlen import mps_flash_attn_varlen
 
 _INF = float("inf")
@@ -150,7 +150,10 @@ def fwd(
     if return_softmax:
         _unsupported("return_attn_probs / S_dmask (return_softmax=True)")
     with torch.no_grad():
-        out_c, lse = _attention_forward_chunked(
+        # Split path (Phase 3b): SDPA computes out at Apple's fused speed and
+        # a streaming fp32 pass computes the lse this ABI is obliged to
+        # return; softcap/ALiBi fall back to the chunked core internally.
+        out_c, lse = mps_flash_attn_func(
             q,
             k,
             v,
@@ -159,6 +162,7 @@ def fwd(
             window_size=_window(window_size_left, window_size_right),
             softcap=softcap,
             alibi_slopes=alibi_slopes,
+            return_lse=True,
         )
         lse = _flip_lse_inf(lse)
     S_dmask, rng_state = _empty_aux(q)
@@ -466,7 +470,10 @@ def fwd_kvcache(
             k_eff = k_cache[:, :sk_max]
             v_eff = v_cache[:, :sk_max]
         uniform_full = cache_leftpad is None and cache_seqlens is None and seqlen_new == 0
-        out_c, lse = _attention_forward_chunked(
+        # Split path (Phase 3b): masked SDPA for out + streaming fp32 lse
+        # pass over the effective cache; softcap/ALiBi fall back to the
+        # chunked core internally.
+        out_c, lse = mps_flash_attn_func(
             q,
             k_eff,
             v_eff,
@@ -477,6 +484,7 @@ def fwd_kvcache(
             alibi_slopes=alibi_slopes,
             seqused_k=None if uniform_full else lens,
             key_leftpad=cache_leftpad.long() if cache_leftpad is not None else None,
+            return_lse=True,
         )
         lse = _flip_lse_inf(lse)
     return _fill_out(out, out_c), lse

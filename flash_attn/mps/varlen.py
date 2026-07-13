@@ -54,37 +54,53 @@ from flash_attn.mps.core import _SDPA_MASK_MAX_ELEMENTS, mps_flash_attn_func
 __all__ = ["mps_flash_attn_varlen"]
 
 # Batched-vs-looped crossover constants, all measured on M4 Max / torch 2.13
-# (benchmarks/mps/bench_varlen.py --skew reproduces the sweep). Three regimes:
+# (benchmarks/mps/bench_varlen.py --skew reproduces the sweep; retuned for
+# the Phase 3b split forward, whose rates are ~3x the old fp32 core's).
+# Shared shortcut: zero padding waste (every sequence used in full at the
+# batch max — pad_area == real_area) always picks batched; it is the same
+# math with fewer launches, and the uniform reshape makes the padding free
+# (measured: 64x128 no-lse 0.79 ms batched vs 2.59 loop; 8x2048 lse 21.6 vs
+# 20.4 — worst case a near-tie). Three regimes otherwise:
 #
-# 1. Core path (lse demanded, or softcap/window/ALiBi/sink): the loop pays
-#    ~1-2 ms of chunked-core dispatch per sequence, the batched call pays for
-#    the padding score-area it wastes (~1.2 ms per M elements, fp32). Batched
-#    wins unless the per-sequence padding waste exceeds roughly one loop
-#    call's worth: (pad_area - real_area) / batch <= _PER_CALL_AREA_CORE.
-#    Measured: 32 ragged seqs 64..1024 -> batched 49 ms vs loop 64 ms;
-#    256 x 32 -> 8 ms vs 66 ms; but 1 x 8192 + 63 x 64 (waste 66M/call) ->
-#    loop 68 ms vs batched 15.6 s. The cap is what keeps skew from being
-#    catastrophic.
-# 2. SDPA-eligible (plain flags, no lse) at inference: each loop iteration is
-#    ONE dense `is_causal` SDPA launch (~0.045 ms) — usually cheaper than the
-#    batched path's boolean-mask build + masked SDPA (~2x the FLOP rate of
-#    is_causal) + pad/repack (~3 ms fixed). Cost model below; the loop wins
-#    at every measured shape except large batches of short sequences
-#    (256 x 32: batched 8.8 ms vs loop 10.3 ms).
+# 1. lse demanded (or softcap/ALiBi/sink -> the chunked core): cost model
+#    below. The batched side scales with the PADDED score area (~1.3 ms per
+#    M elements through the split/masked path). The loop side has a term the
+#    old waste-only threshold couldn't express: per-sequence calls are
+#    ~0.45 ms when lengths repeat but ~2.5-3.5 ms per DISTINCT length (the
+#    lse pass compiles/caches MPS graph executables per shape, and a batch
+#    of all-distinct shapes churns that cache — measured: 32 all-distinct
+#    ragged seqs loop at 111 ms vs 14.5 ms for 32 seqs of only 2 distinct
+#    lengths and comparable area). Measured checks: 32 x ragged 64..1024 ->
+#    model 44.6 vs 98.6, actual 42 vs 111 (batched); 1x4096+31x128 -> model
+#    699 vs 28.6, actual 805 vs 17.3 (looped); 1x1024+31x512 -> model 44.6
+#    vs 24.4, actual 41.3 vs 14.5 (looped).
+# 2. SDPA-eligible (plain flags, no lse) at inference: each loop iteration
+#    is ONE dense `is_causal` SDPA launch (~0.045 ms, no per-shape churn —
+#    only the lse pass pays that) — cheaper than the batched path's
+#    boolean-mask build + masked SDPA (~0.55 ms per M padded elements +
+#    ~1 ms fixed) for ragged batches (32 ragged: loop 4.2 ms vs batched
+#    19.9). Uniform batches take the shortcut above instead.
 # 3. SDPA-eligible under autograd (the FA2 varlen_bwd recompute, FA4
-#    training): one masked-SDPA backward beats `batch` small SDPA backwards
-#    (bench shape fwd+bwd: batched 94 ms vs loop 114 ms), so batched wins
-#    unless skew-capped like regime 1 (with a larger budget — masked SDPA
-#    burns padding an order of magnitude faster than the fp32 core).
-_PER_CALL_AREA_CORE = 1_000_000
+#    training): one masked-SDPA backward beats `batch` small SDPA backwards,
+#    so batched wins unless the per-call padding waste exceeds
+#    _PER_CALL_AREA_SDPA_GRAD (masked SDPA burns padding an order of
+#    magnitude faster than the lse path).
 _PER_CALL_AREA_SDPA_GRAD = 4_000_000
+# Regime-1 cost model (milliseconds):
+#   loop    = call * batch + shape * n_distinct_lengths + rate_l * real_area
+#   batched = fixed + rate_b * padded_area
+_LSE_LOOP_CALL_MS = 0.45
+_LSE_LOOP_SHAPE_MS = 2.5
+_LSE_LOOP_MS_PER_MAREA = 0.55
+_LSE_BATCHED_FIXED_MS = 1.0
+_LSE_BATCHED_MS_PER_MAREA = 1.3
 # Regime-2 cost model (milliseconds): loop = launch * batch + rate * real,
 # batched = fixed + rate * padded. Coarse on purpose — the decisions it takes
 # are 2x-scale, not 10x-scale, everywhere near the boundary.
 _LOOP_SDPA_LAUNCH_MS = 0.045
 _LOOP_SDPA_MS_PER_MAREA = 0.10
-_BATCHED_SDPA_FIXED_MS = 3.0
-_BATCHED_SDPA_MS_PER_MAREA = 0.30
+_BATCHED_SDPA_FIXED_MS = 1.0
+_BATCHED_SDPA_MS_PER_MAREA = 0.55
 
 
 def _seq_lengths(x, cu_seqlens, seqused, batch, name):
@@ -173,15 +189,24 @@ def _prefer_batched(batch, q_used, k_used, loop_hits_sdpa, grad_mode):
         return False  # degenerate; the loop handles it with no compute at all
     pad_area = batch * max_q * max_k
     real_area = sum(uq * uk for uq, uk in zip(q_used, k_used))
-    waste_per_call = (pad_area - real_area) / batch
+    if pad_area == real_area:
+        return True  # zero waste (uniform lengths): same math, fewer launches
     if loop_hits_sdpa:
         if grad_mode:  # regime 3
-            return waste_per_call <= _PER_CALL_AREA_SDPA_GRAD
+            return (pad_area - real_area) / batch <= _PER_CALL_AREA_SDPA_GRAD
         # regime 2
         loop_est = _LOOP_SDPA_LAUNCH_MS * batch + _LOOP_SDPA_MS_PER_MAREA * real_area / 1e6
         batched_est = _BATCHED_SDPA_FIXED_MS + _BATCHED_SDPA_MS_PER_MAREA * pad_area / 1e6
         return batched_est < loop_est
-    return waste_per_call <= _PER_CALL_AREA_CORE  # regime 1
+    # regime 1
+    n_distinct = len(set(zip(q_used, k_used)))
+    loop_est = (
+        _LSE_LOOP_CALL_MS * batch
+        + _LSE_LOOP_SHAPE_MS * n_distinct
+        + _LSE_LOOP_MS_PER_MAREA * real_area / 1e6
+    )
+    batched_est = _LSE_BATCHED_FIXED_MS + _LSE_BATCHED_MS_PER_MAREA * pad_area / 1e6
+    return batched_est < loop_est
 
 
 def mps_flash_attn_varlen(
@@ -220,7 +245,7 @@ def mps_flash_attn_varlen(
         raise ValueError("q must be 4D (batched) or 3D packed with cu_seqlens_q")
 
     q_starts, q_used, q_fulls = _seq_lengths(q, cu_seqlens_q, seqused_q, batch, "query")
-    k_starts, k_used, _ = _seq_lengths(k, cu_seqlens_k, seqused_k, batch, "key")
+    k_starts, k_used, k_fulls = _seq_lengths(k, cu_seqlens_k, seqused_k, batch, "key")
     if q.dim() == 3 and batch > 0 and q_starts[-1] + q_fulls[-1] != q.shape[0]:
         raise ValueError(
             f"cu_seqlens_q covers {q_starts[-1] + q_fulls[-1]} tokens but q has {q.shape[0]}"
@@ -259,8 +284,10 @@ def mps_flash_attn_varlen(
             batch=batch,
             q_starts=q_starts,
             q_used=q_used,
+            q_fulls=q_fulls,
             k_starts=k_starts,
             k_used=k_used,
+            k_fulls=k_fulls,
             have_seqused_q=seqused_q is not None,
             have_seqused_k=seqused_k is not None,
             softmax_scale=softmax_scale,
@@ -299,8 +326,10 @@ def _varlen_batched(
     batch,
     q_starts,
     q_used,
+    q_fulls,
     k_starts,
     k_used,
+    k_fulls,
     have_seqused_q,
     have_seqused_k,
     softmax_scale,
@@ -312,36 +341,58 @@ def _varlen_batched(
     return_lse,
 ):
     """Pad to the batch max, run ONE batched core call with per-batch
-    ``seqused`` masks, repack. See the module docstring."""
+    ``seqused`` masks, repack. See the module docstring.
+
+    Uniform packed lengths (every sequence used in full and all the same
+    length — e.g. fixed-length batches pushed through the varlen API) skip
+    the gather/index_put padding entirely: the packed tensor IS the dense
+    batch, reshaped. The differentiable gathers cost ~5 ms at 8x2048 on MPS
+    (advanced indexing is slow there); the reshape is free — measured, it is
+    what put the batched strategy back ahead of the loop for uniform-large
+    shapes in the Phase 3b re-sweep."""
     device = q.device
     max_q, max_k = max(q_used), max(k_used)
     neg_inf = float("-inf")
 
+    q_uniform = q.dim() == 3 and all(u == f == max_q for u, f in zip(q_used, q_fulls))
+    k_uniform = k.dim() == 3 and all(u == f == max_k for u, f in zip(k_used, k_fulls))
+
+    q_src = q_flat = None
     if q.dim() == 3:
-        q_src, q_flat = _pad_indices(q_starts, q_used, max_q, batch, device)
-        qp = _pad_packed(q, q_src, q_flat, batch, max_q)
-        # Ragged rows need the per-batch mask; uniform rows don't (the padded
-        # tensor is then exactly a dense batch and the diagonal already
-        # aligns, since every sequence's used length IS the padded length).
-        seqused_q_arg = (
-            None
-            if all(u == max_q for u in q_used)
-            else torch.tensor(q_used, device=device, dtype=torch.long)
-        )
+        if q_uniform:
+            qp = q.reshape(batch, max_q, *q.shape[1:])
+            seqused_q_arg = None
+        else:
+            q_src, q_flat = _pad_indices(q_starts, q_used, max_q, batch, device)
+            qp = _pad_packed(q, q_src, q_flat, batch, max_q)
+            # Ragged rows need the per-batch mask; uniform rows don't (the
+            # padded tensor is then exactly a dense batch and the diagonal
+            # already aligns, since every sequence's used length IS the
+            # padded length).
+            seqused_q_arg = (
+                None
+                if all(u == max_q for u in q_used)
+                else torch.tensor(q_used, device=device, dtype=torch.long)
+            )
     else:
         qp = q[:, :max_q]
         seqused_q_arg = (
             torch.tensor(q_used, device=device, dtype=torch.long) if have_seqused_q else None
         )
     if k.dim() == 3:
-        k_src, k_flat = _pad_indices(k_starts, k_used, max_k, batch, device)
-        kp = _pad_packed(k, k_src, k_flat, batch, max_k)
-        vp = _pad_packed(v, k_src, k_flat, batch, max_k)
-        seqused_k_arg = (
-            None
-            if all(u == max_k for u in k_used)
-            else torch.tensor(k_used, device=device, dtype=torch.long)
-        )
+        if k_uniform:
+            kp = k.reshape(batch, max_k, *k.shape[1:])
+            vp = v.reshape(batch, max_k, *v.shape[1:])
+            seqused_k_arg = None
+        else:
+            k_src, k_flat = _pad_indices(k_starts, k_used, max_k, batch, device)
+            kp = _pad_packed(k, k_src, k_flat, batch, max_k)
+            vp = _pad_packed(v, k_src, k_flat, batch, max_k)
+            seqused_k_arg = (
+                None
+                if all(u == max_k for u in k_used)
+                else torch.tensor(k_used, device=device, dtype=torch.long)
+            )
     else:
         kp = k[:, :max_k]
         vp = v[:, :max_k]
@@ -366,6 +417,13 @@ def _varlen_batched(
 
     if q.dim() == 3:
         total_q = q.shape[0]
+        if q_uniform:
+            out = out_p.reshape(total_q, *out_p.shape[2:])
+            lse = (
+                # (b, h, max_q) -> (h, total_q), matching _repack_lse's layout
+                lse_p.permute(1, 0, 2).reshape(lse_p.shape[1], total_q) if return_lse else None
+            )
+            return out, lse
         out = _repack_out(out_p, q_src, q_flat, total_q)
         lse = _repack_lse(lse_p, q_src, q_flat, total_q) if return_lse else None
         return out, lse

@@ -447,7 +447,29 @@ def test_heuristic_moderate_ragged_lse_picks_batched():
     assert _prefer_batched(32, lens, lens, loop_hits_sdpa=False, grad_mode=False)
 
 
-def test_heuristic_sdpa_inference_large_seqs_picks_loop():
-    # per-sequence is_causal SDPA launches beat masked batched SDPA here
+def test_heuristic_uniform_lengths_pick_batched():
+    # Zero padding waste: the uniform reshape (Phase 3b) makes the batched
+    # path the same math with fewer launches — measured 4.11 ms batched vs
+    # 4.93 ms looped for no-lse 8x2048 (this exact case used to prefer the
+    # loop when padding went through gather/index_put).
     lens = [2048] * 8
-    assert not _prefer_batched(8, lens, lens, loop_hits_sdpa=True, grad_mode=False)
+    assert _prefer_batched(8, lens, lens, loop_hits_sdpa=True, grad_mode=False)
+    assert _prefer_batched(8, lens, lens, loop_hits_sdpa=False, grad_mode=False)
+
+
+def test_heuristic_lse_distinct_lengths_term():
+    # Regime 1's loop estimate charges per DISTINCT length (MPS compiles and
+    # caches graph executables per shape; an all-distinct batch churns that).
+    # Same padded area, same waste: all-distinct ragged -> batched, two
+    # distinct lengths -> looped. Measured: 42 ms batched vs 111 ms looped
+    # (32 all-distinct, 64..1024) and 41 ms batched vs 14.5 ms looped
+    # (1x1024 + 31x512).
+    torch.manual_seed(1)
+    distinct = list(range(64, 64 + 32 * 30, 30))  # 32 distinct lengths
+    assert _prefer_batched(
+        32, distinct, distinct, loop_hits_sdpa=False, grad_mode=False
+    )
+    two_shapes = [1024] + [512] * 31
+    assert not _prefer_batched(
+        32, two_shapes, two_shapes, loop_hits_sdpa=False, grad_mode=False
+    )

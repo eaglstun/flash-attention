@@ -615,7 +615,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     torch.random.manual_seed(0)
     batch_size = 4
     nheads = 9
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     qkv = torch.randn(
         batch_size, seqlen, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
     )
@@ -764,7 +764,7 @@ def test_flash_attn_varlen_qkvpacked(
     torch.random.manual_seed(0)
     batch_size = 5
     nheads = 6
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     qkv = torch.randn(
         batch_size, seqlen, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
     )
@@ -941,7 +941,7 @@ def test_flash_attn_output(
     nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
         # Ensure the values of qk are at least within softcap range.
@@ -1210,7 +1210,7 @@ def test_flash_attn_varlen_output(
     nheads = 6 if softcap == 0.0 else 4  # softcap reference impl takes more memory
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 2)
     assert nheads % nheads_k == 0
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if softcap > 0:
         # Ensure the values of qk are at least within softcap range.
@@ -1517,7 +1517,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     torch.random.manual_seed(0)
     batch_size = 8
     nheads = 9
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
@@ -1630,7 +1630,7 @@ def test_flash_attn_varlen_causal(
     torch.random.manual_seed(0)
     batch_size = 8
     nheads = 9
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
 
     if paged_kv_block_size is None:
@@ -1796,7 +1796,7 @@ def test_flash_attn_splitkv(
     torch.random.manual_seed(0)
     batch_size = 1
     nheads = 12
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
@@ -1964,7 +1964,7 @@ def test_flash_attn_kvcache(
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
     if new_kv:
@@ -2447,7 +2447,7 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     torch.random.manual_seed(0)
     batch_size = 4
     nheads = 9
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
@@ -2505,7 +2505,7 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
     torch.random.manual_seed(0)
     batch_size = 2
     nheads = 9
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)).tolist())  # ints, not tensors: see docs/apple_silicon/MPS_STATUS.md (torch-MPS landmines)
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)

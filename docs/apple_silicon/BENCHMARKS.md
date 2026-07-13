@@ -424,3 +424,149 @@ across `varlen_causal` (960), `causal` (960), `varlen_output` (1920),
 (3456), and the bwd corner cases (68) — every path this change touches,
 with zero failures. Padded/masked positions contribute exactly zero
 (forward and backward) by construction and by test.
+
+---
+
+## Phase 3b — the lse split + the SDPA-powered backward, measured
+
+**Landed 2026-07-13** (branch `feature/apple-silicon-mps`). Scope: work
+items 3 and 4 of the Phase-3 list — the last two. Same machine and
+methodology (`torch.mps.synchronize()` before and after every timed region;
+medians; "before" measured on the committed Phase-3a code via a detached
+worktree, not from memory). The prototype sweeps lived in `agent_space/`
+(disposable lab notes, not committed); the public benches
+(`benchmarks/mps/bench_attention.py`, `bench_varlen.py [--skew]`) cover the
+same paths and reproduce the tables.
+
+### What changed
+
+- **Split forward** (`flash_attn/mps/core.py`): when the flags are
+  mask-shaped (no softcap/ALiBi/sink; causal, local windows, varlen
+  `seqused`/leftpad all count as mask-shaped now) and the dtype is
+  fp16/bf16, `out` comes from one fused-SDPA call (`_sdpa_out` — boolean
+  mask built by the same `_build_score_mask` as everything else,
+  bottom-right aligned, fully-masked rows unmasked-then-zeroed) and `lse`
+  from `_lse_forward`: a streaming fp32 pass over Q blocks that computes
+  QK^T (grouped einsum over native KV heads — MPS matmul collapses on
+  skinny decode blocks, einsum does not: 2.2 vs 7.3 ms), masks only the
+  diagonal strips, truncates K to the causally visible range (with a
+  global `max(seqused_k - seqused_q)` bound for varlen, one small sync,
+  amortized above 256 query rows), and reduces via
+  `lse = amax(scores) - log(amax(softmax(scores)))` — the shifted exp/sum
+  runs inside PyTorch's fused fp32 softmax kernel because a
+  hand-materialized broadcast `scores - max` is ~3x slower on MPS. lse
+  numerics verified against fp64 to the same error as the chunked core,
+  including a large-logit stress test.
+- **SDPA-powered backward** (`_attention_backward_chunked`): the Q-chunked
+  recompute now differentiates SDPA per chunk on fp32 leaves for fp16/bf16
+  (boolean keep-mask; ALiBi becomes an additive fp32 bias from the same
+  `_alibi_bias` the forward uses), with the manual differentiable core kept
+  for softcap, learnable_sink, gradients-through-lse, `seqlen_k == 1`
+  (single-key softmax: dq/dk exactly 0 must stay exactly 0) and fp32.
+- **INT_MAX guard**: direct SDPA autograd (the no-lse paths) is capped at
+  2^30 score elements; past it the recompute backward takes over.
+  **Before this, 16k-context training hard-crashed on MPS in every
+  configuration** (`MPSGraph does not support tensor dims larger than
+  INT_MAX`) — reconfirmed on the Phase-3a code before the fix. Now:
+  1x16384 h8 d64 FA2 fwd+bwd completes in 402 ms.
+- **fp32 dtype gate**: fp32 keeps the Phase-1 chunked/manual paths on the
+  lse-producing and backward routes. Its parity budgets are ulp-referenced
+  to fp64 AND pinned cross-device (CPU vs MPS agree to 4 ulp); Apple's
+  fused kernels are accurate (verified vs fp64) but not bit-deterministic
+  across devices. fp16/bf16 — the dtypes anyone trains or serves with on
+  this hardware — get all of the speed; no shipped fp32 fast path was
+  regressed.
+- **Varlen driver** (`flash_attn/mps/varlen.py`): uniform packed lengths
+  now pad by zero-copy reshape (the differentiable gather/index_put
+  padding costs ~5 ms at 8x2048 — MPS advanced indexing is slow); the
+  batched-vs-looped heuristic was re-measured and regime 1 is now a cost
+  model with a per-DISTINCT-length term (the lse pass compiles/caches MPS
+  graph executables per shape: 32 all-distinct lengths loop at 111 ms
+  where 2 distinct lengths of the same area loop at 14.5 ms).
+
+### Dense forward, `return_lse=True` (the FA2 `fwd` obligation) — fp16 causal
+
+| shape           | Phase 3a | Phase 3b    | speedup  | raw SDPA (no lse) | 3b / SDPA |
+| --------------- | -------- | ----------- | -------- | ----------------- | --------- |
+| 32x512 h8 d64   | 10.3 ms  | **6.9 ms**  | 1.5x     | 0.98 ms           | 7.1x      |
+| 16x1024 h8 d64  | 17.7 ms  | **10.7 ms** | 1.7x     | 1.59 ms           | 6.7x      |
+| 8x2048 h8 d64   | 33.5 ms  | **19.6 ms** | 1.7x     | 2.89 ms           | 6.8x      |
+| 4x4096 h8 d64   | 64.6 ms  | **38.2 ms** | 1.7x     | 5.52 ms           | 6.9x      |
+| 2x8192 h8 d64   | 128.4 ms | **60.0 ms** | 2.1x     | 10.70 ms          | 5.6x      |
+| 1x16384 h8 d64  | 254.7 ms | **103.9 ms**| 2.5x     | 21.37 ms          | 4.9x      |
+| 8x2048 h8 d128  | 41.6 ms  | **25.6 ms** | 1.6x     | 5.64 ms           | 4.5x      |
+| 8x2048 8/2 d64  | 33.0 ms  | **19.1 ms** | 1.7x     | 2.87 ms           | 6.7x      |
+| 1x16384 h8 d128 | 302.6 ms | **133.9 ms**| 2.3x     | 42.88 ms          | 3.1x      |
+
+The honest sentence about the target: the goal was "within ~2x of raw
+SDPA"; the landing is **3-7x**. The residual is the fp32 lse pass itself —
+QK^T recomputed and reduced in fp32 (the discipline this port does not
+trade), on hardware where the fp32 score traffic + exp is 3-5x the cost of
+the whole fused fp16 attention. Getting closer than this means either fp16
+lse scores (a silently-wrong lse — rejected), trusting SDPA internals to
+reconstruct lse (a phantom-key trick was built, measured, and **rejected**:
+0.26 lse error under a large-logit stress test), or a fused Metal kernel
+(out of scope by the Phase-2 decision).
+
+### Dense forward+backward (training, lse path) — fp16 causal
+
+| shape           | Phase 3a  | Phase 3b     | speedup | vs Phase-2 core    |
+| --------------- | --------- | ------------ | ------- | ------------------ |
+| 32x512 h8 d64   | 44.4 ms   | **25.2 ms**  | 1.8x    | 52.6 -> 2.1x       |
+| 8x2048 h8 d64   | 157.4 ms  | **63.1 ms**  | 2.5x    | 216.7 -> 3.4x      |
+| 4x4096 h8 d64   | 311.1 ms  | **114.1 ms** | 2.7x    | 443.9 -> 3.9x      |
+| 2x8192 h8 d64   | 618.1 ms  | **203.6 ms** | 3.0x    | 868.9 -> 4.3x      |
+| 1x16384 h8 d64  | 1204.8 ms | **367.1 ms** | 3.3x    | 1739.1 -> 4.7x     |
+| 8x2048 h8 d128  | 191.6 ms  | **86.8 ms**  | 2.2x    | 311.6 -> 3.6x      |
+| 8x2048 8/2 d64  | 205.0 ms  | **89.4 ms**  | 2.3x    | (GQA inversion gone) |
+
+Memory stays flat (Q-chunked recompute) — this is the path that trains 16k+
+context where plain SDPA autograd cannot. FA2-seam roundtrip (fwd + explicit
+`bwd`): 8x2048 99.4 -> 83.0 ms; 2x8192 377.5 -> 316.1 ms; 1x16384
+**crash -> 402.3 ms**.
+
+### Decode (`flash_attn_with_kvcache`, b=32, sq=1, cache 4096, 8/2 hd128)
+
+| variant                 | Phase 2 | Phase 3a | Phase 3b    |
+| ----------------------- | ------- | -------- | ----------- |
+| uniform `cache_seqlens` | 52.4 ms | 6.41 ms  | **3.71 ms** |
+| ragged `cache_seqlens`  | ~53 ms  | 6.22 ms  | **4.10 ms** |
+
+14x cumulative from Phase 2. The no-lse batched-SDPA bound is ~0.5 ms; the
+gap is the fp32 lse pass over the whole effective cache (dominated by the
+one-time fp32 cast of K and a skinny einsum), which is what `fwd_kvcache`'s
+ABI obliges us to produce every token.
+
+### Varlen (strategy sweep highlights, fp16 causal, h8 d64)
+
+| workload                     | 3a (auto)   | 3b (auto)   | note                                    |
+| ---------------------------- | ----------- | ----------- | --------------------------------------- |
+| 32 x 64..1024 ragged, lse    | 45.2 ms     | **36.9 ms** | batched; K-truncation via global bound  |
+| 64 x 128 uniform, lse        | 6.4 ms      | **2.9 ms**  | batched via zero-copy reshape           |
+| 256 x 32 uniform, lse        | 8.3 ms      | **4.4 ms**  | batched via zero-copy reshape           |
+| 256 x 32 uniform, no lse     | —           | **0.96 ms** | was 8.8 ms batched at 3a                |
+| 8 x 2048 uniform, no lse     | 4.31 loop   | **3.7 ms**  | batched now wins (reshape, no gathers)  |
+| 1x8192 + 63x64 skew, lse     | 68 ms loop  | **45.9 ms** | loop (heuristic; batched would be ~25 s)|
+
+### Correctness (what the gates caught this phase)
+
+- `tests/mps/`: **945 passed** (911 pre-existing + 34 new split-path /
+  heuristic regression tests in `tests/mps/test_split_paths.py` and
+  `test_batched_paths.py`). **Zero tolerance changes.** The
+  `float32/lse = 1.0000` watch-item ratio is unchanged, same worst case
+  (it lives on the eager-impl grid, untouched by the split paths).
+- The parity grid rejected two would-be regressions during development,
+  exactly as designed: (1) a grouped-einsum GQA rewrite of the *reference*
+  core moved fp32 MQA dk error to ~3x the in-dtype baseline — reverted
+  (the perf-bearing paths use `enable_gqa` SDPA instead; the reference
+  keeps the oracle's own repeat formulation); (2) SDPA-recompute for fp32
+  broke the 4-ulp cross-device pins — hence the fp32 dtype gate.
+- The FA2 suite caught a real torch-MPS bug: integer comparisons against
+  0-dim CPU tensors are silently wrong at (2048, 2048) scale on MPS, which
+  made the suite's own `construct_local_mask` reference produce 178k wrong
+  mask positions whenever `window_size` came from `torch.randint` (and had
+  been silently matching this backend's equally-affected pre-Phase-3b mask
+  arithmetic). The suite now coerces drawn windows to ints (identical
+  values — the CUDA extension's pybind coerces anyway); the backend
+  coerces at every entry (`_window_ints`) and pins the equivalence in
+  `tests/mps/test_split_paths.py::test_tensor_window_sizes_match_ints`.

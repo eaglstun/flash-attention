@@ -72,6 +72,57 @@ __all__ = [
 _KV_CHUNK_SIZE_FWD = 1024
 _Q_CHUNK_SIZE_BWD = 512
 
+# Phase 3b split-forward constants (all measured on M4 Max / torch 2.13;
+# BENCHMARKS.md has the tables and the sweep provenance):
+#
+# - _LSE_BLOCK_ELEMENTS bounds the fp32 score block a single _lse_forward
+#   Q-block materializes (elements, i.e. bytes / 4). 2^28 is 1 GiB of fp32
+#   scores per block — big enough that the block loop never dominates, small
+#   enough to stay memory-bounded at any seqlen.
+# - _SDPA_AUTOGRAD_MAX_ELEMENTS caps the no-lse fast path when gradients are
+#   required: torch SDPA's MPS backward materializes the full
+#   (batch, heads, seqlen_q, seqlen_k) attention matrix, which hard-fails
+#   with "MPSGraph does not support tensor dims larger than INT_MAX" past
+#   2^31 elements (measured: 1x16384 h8 dies) and costs O(s^2) memory below
+#   it (12 GiB at 2x8192 h8 fp16 — the cap). Past it the memory-flat
+#   Q-chunked SDPA-recompute backward takes over at near-identical speed
+#   (measured: 8x2048 h8 fwd+bwd 65.6 ms full-autograd vs 64.8 ms
+#   chunked-recompute).
+# - _SDPA_BWD_CHUNK_ELEMENTS bounds one recompute chunk's score block in the
+#   backward (shrinks the Q-chunk when batch * heads * seqlen_k is huge).
+#
+# fp32 dtype gate: the NEW Phase 3b routes (split forward, SDPA recompute
+# backward) are fp16/bf16-only. fp32's parity contract is ulp-referenced to
+# an fp64 oracle AND cross-device deterministic (tests/mps pins CPU-vs-MPS
+# agreement of the core to 4 ulp): Apple's fused SDPA and CPU's SDPA differ
+# from each other and from the reference reduction order at ~1e-6 — well
+# inside every fp16/bf16 budget, but 2-4x outside fp32's. So fp32 keeps the
+# hand-rolled fp32 ops on the lse-producing/backward paths (Phase 1
+# numerics, bit-stable across devices), while fp16/bf16 — the dtypes anyone
+# trains or serves with — get the split speed. The long-shipped no-lse fp32
+# SDPA fast paths (budget-gated, no cross-device pin) are unchanged.
+_LSE_BLOCK_ELEMENTS = 2**28
+_SDPA_AUTOGRAD_MAX_ELEMENTS = 2**30
+_SDPA_BWD_CHUNK_ELEMENTS = 2**28
+
+
+def _window_ints(
+    window_size: Tuple[Optional[int], Optional[int]],
+) -> Tuple[Optional[int], Optional[int]]:
+    """Coerce window sizes to plain Python ints (None stays None).
+
+    The FA2 suite (and user code imitating it) passes ``torch.randint``
+    RESULTS — 0-dim tensors — as window sizes; the CUDA extension's pybind11
+    signature coerces them to int, so this backend must too. It is not just
+    hygiene: ``x[lo:hi]`` with a 0-dim *tensor* bound silently returns the
+    UNSLICED tensor on torch 2.13, so the visible-range K-truncation in the
+    split forward / SDPA recompute backward would quietly evaporate while
+    the masks are still built for the truncated width — wrong gradients,
+    caught by test_flash_attn_qkvpacked on MPS (Phase 3b).
+    """
+    wl, wr = window_size
+    return (None if wl is None else int(wl), None if wr is None else int(wr))
+
 
 def _build_score_mask(
     seqlen_q: int,
@@ -243,6 +294,7 @@ def _attention_forward(
     assert nheads_q % nheads_kv == 0, "nheads_q must be a multiple of nheads_kv (GQA/MQA)"
     if softmax_scale is None:
         softmax_scale = head_dim ** (-0.5)
+    window_size = _window_ints(window_size)
     if causal:
         window_size = (window_size[0], 0)
     out_dtype = q.dtype
@@ -252,7 +304,15 @@ def _attention_forward(
     qf, kf, vf = q.float(), k.float(), v.float()
     heads_per_kv = nheads_q // nheads_kv
     if heads_per_kv > 1:
-        # Query head i uses KV head i // heads_per_kv (repeat pattern "h -> (h g)").
+        # Query head i uses KV head i // heads_per_kv (repeat pattern
+        # "h -> (h g)"). The repeat_interleave copies are deliberate: this is
+        # the *reference* core, and the oracle (attention_ref) uses the same
+        # repeat formulation, so the backward's reduction order matches it to
+        # within the fp32 error budget (a grouped einsum lands ~3x the
+        # in-dtype baseline's dk error on fp32 MQA — measured, Phase 3b).
+        # The performance-bearing paths never come through here for GQA: the
+        # split forward and the SDPA recompute backward use enable_gqa, the
+        # chunked forward uses grouped einsums.
         kf = kf.repeat_interleave(heads_per_kv, dim=2)
         vf = vf.repeat_interleave(heads_per_kv, dim=2)
 
@@ -358,6 +418,7 @@ def _attention_forward_chunked(
     assert nheads_q % nheads_kv == 0
     if softmax_scale is None:
         softmax_scale = head_dim ** (-0.5)
+    window_size = _window_ints(window_size)
     if causal:
         window_size = (window_size[0], 0)
     device = q.device
@@ -457,19 +518,524 @@ def _attention_forward_chunked(
     return out, lse
 
 
+def _sdpa_out(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    key_leftpad: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Attention output via ``F.scaled_dot_product_attention``, or ``None``
+    when it cannot be expressed within the mask budget.
+
+    The caller must already have checked the flags SDPA cannot express at all
+    (softcap, ALiBi, learnable_sink — they change the scores/denominator, not
+    just the mask). Everything mask-shaped is handled here:
+
+    - plain/GQA dense, and ``is_causal`` only when ``seqlen_q == seqlen_k``
+      (SDPA's causal is top-left aligned; flash-attention's is bottom-right);
+    - causal with unequal seqlens, local windows, and the per-batch varlen /
+      kv-cache formulation (``seqused_q``/``seqused_k``/``key_leftpad``) via a
+      boolean keep-mask built by :func:`_build_score_mask` — one mask
+      implementation, no re-derivation.
+
+    Fully-masked rows (padding rows, causal rows with no visible keys) are
+    temporarily unmasked to keep SDPA's softmax NaN-free, then forced to
+    exactly 0; the ``torch.where`` routes any upstream gradient to the
+    constant branch, so those rows contribute exactly-0 gradients too.
+    Differentiable throughout — usable both under ``no_grad`` (the split
+    forward) and under autograd (the no-lse fast path).
+    """
+    batch, seqlen_q = q.shape[0], q.shape[1]
+    seqlen_k = k.shape[1]
+    device = q.device
+    window_size = _window_ints(window_size)
+    varlen = seqused_q is not None or seqused_k is not None or key_leftpad is not None
+    if (
+        not varlen
+        and window_size[0] is None
+        and window_size[1] is None
+        and (not causal or seqlen_q == seqlen_k)
+    ):
+        return _sdpa_bshd(q, k, v, is_causal=causal, scale=softmax_scale).contiguous()
+    if batch * seqlen_q * seqlen_k > _SDPA_MASK_MAX_ELEMENTS:
+        return None
+    mask = _build_score_mask(
+        seqlen_q,
+        seqlen_k,
+        (window_size[0], 0) if causal else window_size,
+        device,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        key_leftpad=key_leftpad,
+    )
+    if mask is None:  # nothing to mask after all
+        return _sdpa_bshd(q, k, v, is_causal=False, scale=softmax_scale).contiguous()
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)  # (1, sq, sk)
+    all_masked = mask.all(dim=-1, keepdim=True)  # (b-or-1, sq-or-1, 1)
+    keep = ~mask | all_masked
+    out = _sdpa_bshd(q, k, v, attn_mask=keep.unsqueeze(1), scale=softmax_scale)
+    out = torch.where(
+        all_masked.unsqueeze(-1),  # (b-or-1, sq-or-1, 1, 1), broadcasts over h, d
+        torch.zeros((), dtype=out.dtype, device=device),
+        out,
+    )
+    return out.contiguous()
+
+
+def _lse_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    key_leftpad: Optional[torch.Tensor] = None,
+    block_elements: int = _LSE_BLOCK_ELEMENTS,
+) -> torch.Tensor:
+    """lse-only forward: fp32 logsumexp of the scaled, masked scores, streamed
+    over Q blocks. Needs QK^T but never touches V — roughly a third of the
+    full attention's cost — and materializes at most ``block_elements`` fp32
+    scores at a time, so it is O(seqlen * block) memory like the chunked core.
+
+    This is the second half of the Phase 3b split forward (SDPA computes
+    ``out``, this pass computes ``lse``); it covers exactly the flags
+    :func:`_sdpa_out` covers (causal / window / varlen-seqused / leftpad).
+    softcap, ALiBi and learnable_sink stay on the chunked core, which
+    produces out and lse together.
+
+    Numerics: scores come from an fp32 matmul (inputs upcast, same as the
+    chunked core) and the reduction is ``lse = m - log(max(softmax(scores)))``
+    with ``m = amax(scores)`` — mathematically the plain row logsumexp the
+    oracle computes, arranged so the shifted exp/sum runs inside PyTorch's
+    fused fp32 softmax kernel (a broadcast ``scores - m`` materialized by hand
+    is ~3x slower on MPS — measured, torch 2.13 / M4 Max, same pathology as
+    the masked_fill note above). Verified against an fp64 oracle to the same
+    error as the chunked core's online softmax, including a large-logit
+    stress test (docs/apple_silicon/BENCHMARKS.md, Phase 3b).
+
+    Returns fp32 ``(batch, nheads_q, seqlen_q)``; fully-masked and padding
+    rows get ``-inf`` (never NaN).
+    """
+    batch, seqlen_q, nheads_q, head_dim = q.shape
+    _, seqlen_k, nheads_kv, _ = k.shape
+    assert nheads_q % nheads_kv == 0
+    if softmax_scale is None:
+        softmax_scale = head_dim ** (-0.5)
+    window_size = _window_ints(window_size)
+    if causal:
+        window_size = (window_size[0], 0)
+    window_left, window_right = window_size
+    device = q.device
+    neg_inf = float("-inf")
+    varlen = seqused_q is not None or seqused_k is not None or key_leftpad is not None
+    g = nheads_q // nheads_kv
+
+    lse = torch.empty((batch, nheads_kv, g, seqlen_q), device=device, dtype=torch.float32)
+    if seqlen_q == 0:
+        return lse.reshape(batch, nheads_q, seqlen_q)
+    if seqlen_k == 0:
+        lse.fill_(neg_inf)
+        return lse.reshape(batch, nheads_q, seqlen_q)
+
+    # Head grouping as in the chunked core: query head h = kv * g + gi uses
+    # KV head kv, so splitting the head dim as (nheads_kv, g) lines each
+    # group up with its KV head and one grouped einsum serves all query
+    # heads. einsum, not a pre-transposed batched matmul: MPS matmul
+    # collapses on skinny blocks (decode, n=1: 7.3 ms vs einsum's 2.2 ms —
+    # measured, BENCHMARKS.md Phase 3b) and merely ties it on dense
+    # blocks. Both casts happen exactly once.
+    qg = (q.float() * softmax_scale).reshape(batch, seqlen_q, nheads_kv, g, head_dim)
+    kf = k.float()  # (b, sk, hkv, d)
+
+    shift = seqlen_k - seqlen_q  # bottom-right diagonal (dense case)
+    # Per-batch varlen diagonals defeat the static causal K-truncation below,
+    # but a global bound recovers it: column c is visible to row r of batch i
+    # only if c <= r + window_right + (sk_end_i - sq_eff_i) (key_leftpad
+    # cancels out of the raw-column form), so max_i(sk_end_i - sq_eff_i)
+    # bounds every batch at once. Costs one small GPU->CPU sync, so it is
+    # only computed where the win dwarfs it (large seqlen_q; decode's sq=1
+    # gains nothing and would pay the sync on every token).
+    varlen_shift_bound = None
+    if varlen and window_right is not None and seqlen_q > 256:
+        sk_end = (
+            seqused_k.to(torch.long)
+            if seqused_k is not None
+            else torch.tensor(seqlen_k, device=device)
+        )
+        sq_eff = (
+            seqused_q.to(torch.long)
+            if seqused_q is not None
+            else torch.tensor(seqlen_q, device=device)
+        )
+        varlen_shift_bound = int((sk_end - sq_eff).max())
+    q_block = min(seqlen_q, max(128, block_elements // max(1, batch * nheads_q * seqlen_k)))
+    truncatable = (
+        window_left is not None or window_right is not None
+        if not varlen
+        else varlen_shift_bound is not None
+    )
+    if truncatable and seqlen_q >= 512:
+        # Causal/windowed: the visible-range slicing only saves work when the
+        # sequence splits into several blocks (a single block computes the
+        # full rectangle). Forcing >= 2 blocks costs one extra dispatch and
+        # roughly halves the computed score area for causal — measured knee
+        # at 1024-row blocks for 2k, adaptive above (BENCHMARKS.md, Phase 3b).
+        q_block = min(q_block, max(256, seqlen_q // 2))
+    ninf_f = torch.full((), neg_inf, device=device)
+
+    for r0 in range(0, seqlen_q, q_block):
+        r1 = min(r0 + q_block, seqlen_q)
+        n = r1 - r0
+        # Visible K range for this block (dense only — with per-batch varlen
+        # lengths the range is per-batch, so the full range is kept and the
+        # mask does the work, except for the global varlen_shift_bound above).
+        if varlen:
+            lo_vis, hi_vis = 0, seqlen_k
+            if varlen_shift_bound is not None:
+                hi_vis = max(0, min(seqlen_k, (r1 - 1) + varlen_shift_bound + window_right + 1))
+        else:
+            hi_vis = (
+                seqlen_k
+                if window_right is None
+                else max(0, min(seqlen_k, (r1 - 1) + shift + window_right + 1))
+            )
+            lo_vis = 0 if window_left is None else max(0, min(seqlen_k, r0 + shift - window_left))
+        if hi_vis <= lo_vis:
+            lse[:, :, :, r0:r1] = neg_inf
+            continue
+        w = hi_vis - lo_vis
+        scores = torch.einsum(
+            "bthgd,bshd->bhgts", qg[:, r0:r1], kf[:, lo_vis:hi_vis]
+        )  # (b, hkv, g, n, w)
+
+        if varlen:
+            mask = _build_score_mask(
+                n,
+                w,
+                window_size,
+                device,
+                row_offset=r0,
+                seqlen_q_total=seqlen_q,
+                col_offset=lo_vis,
+                seqlen_k_total=seqlen_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                key_leftpad=key_leftpad,
+            )
+            if mask is not None:
+                # (b, n-or-1, w) -> broadcast over (hkv, g)
+                scores = torch.where(mask.unsqueeze(1).unsqueeze(1), ninf_f, scores)
+        elif window_left is not None or window_right is not None:
+            # Only the diagonal strips need masking: columns in
+            # [all_lo, all_hi) are visible to every row of the block, columns
+            # outside [lo_vis, hi_vis) were never computed.
+            all_lo = lo_vis if window_left is None else min(hi_vis, (r1 - 1) + shift - window_left)
+            all_hi = hi_vis if window_right is None else max(lo_vis, r0 + shift + window_right + 1)
+            all_lo = max(all_lo, lo_vis)
+            all_hi = min(all_hi, hi_vis)
+            if all_lo >= all_hi:  # no all-visible middle: mask the whole block
+                strips = [(lo_vis, hi_vis)]
+            else:
+                strips = [(lo_vis, all_lo), (all_hi, hi_vis)]
+            for c0, c1 in strips:
+                if c1 <= c0:
+                    continue
+                smask = _build_score_mask(
+                    n,
+                    c1 - c0,
+                    window_size,
+                    device,
+                    row_offset=r0,
+                    seqlen_q_total=seqlen_q,
+                    col_offset=c0,
+                    seqlen_k_total=seqlen_k,
+                )
+                if smask is None:
+                    continue
+                a, b_ = c0 - lo_vis, c1 - lo_vis
+                scores[..., a:b_] = torch.where(
+                    smask.view(1, 1, 1, n, c1 - c0), ninf_f, scores[..., a:b_]
+                )
+
+        m = scores.amax(dim=-1)  # (b, hkv, g, n)
+        p = torch.softmax(scores, dim=-1)  # fused shifted exp/sum, fp32
+        pmax = p.amax(dim=-1)
+        finite = torch.isfinite(m)  # False only when the whole row is masked
+        # softmax of an all(-inf) row is NaN; torch.where selects, it does not
+        # propagate NaN from the unselected branch.
+        l_blk = torch.where(
+            finite,
+            m - torch.log(torch.where(finite, pmax, torch.ones_like(pmax))),
+            torch.full_like(m, neg_inf),
+        )
+        lse[:, :, :, r0:r1] = l_blk
+    return lse.reshape(batch, nheads_q, seqlen_q)
+
+
+def _attention_backward_chunked(
+    dout: torch.Tensor,
+    dlse: Optional[torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    learnable_sink: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    key_leftpad: Optional[torch.Tensor] = None,
+    q_chunk_size: int = _Q_CHUNK_SIZE_BWD,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Memory-flat Q-chunked recompute backward (the flash-attention backward
+    in torch ops). Returns ``(dq, dk, dv)`` in the input dtypes.
+
+    Two recompute strategies per chunk (Phase 3b):
+
+    - **SDPA** (default): recompute the chunk with
+      ``F.scaled_dot_product_attention`` on fp32 leaves and differentiate
+      through it. Causal/window/varlen masking is expressed as a boolean
+      keep-mask from :func:`_build_score_mask` (ALiBi adds an fp32 additive
+      bias from :func:`_alibi_bias` — same builders as the forward, no second
+      mask implementation). ~2.5x faster than the manual recompute (measured,
+      M4 Max), gradients verified against fp64 to the same error as the
+      manual path. Fully-masked rows are unmasked-then-zeroed exactly like
+      :func:`_sdpa_out`, so they contribute exactly-0 gradients.
+    - **manual**: differentiate :func:`_attention_forward` per chunk — kept
+      for what SDPA cannot express (softcap, learnable_sink) and for
+      gradients arriving through lse (``dlse``), which need the recompute to
+      produce a differentiable lse.
+
+    fp32 leaves both ways: per-chunk dK/dV come back fp32, the cross-chunk
+    accumulation below is exact, and dK/dV are rounded to the storage dtype
+    exactly once at the end (pinned by test_bwd_chunk_accumulation_exact).
+    """
+    batch, seqlen_q, nheads_q, head_dim = q.shape
+    seqlen_k = k.shape[1]
+    device = q.device
+    if softmax_scale is None:
+        softmax_scale = head_dim ** (-0.5)
+    window_size = _window_ints(window_size)
+    if causal:
+        window_size = (window_size[0], 0)
+    window_left, window_right = window_size
+    varlen = seqused_q is not None or seqused_k is not None or key_leftpad is not None
+    shift = seqlen_k - seqlen_q
+    neg_inf = float("-inf")
+
+    # seqlen_k == 1 stays manual: a single-key softmax is the constant 1, so
+    # dq and dk are *exactly* 0 — the manual recompute preserves that exact
+    # cancellation (autograd's softmax backward subtracts the same product
+    # from itself), while SDPA's backward computes dP and rowsum(dout*out)
+    # separately and leaves ~1-ulp noise where an exact zero is guaranteed
+    # (pinned by test_bwd_chunk_accumulation_exact and the (1,1) parity case,
+    # whose fp32-vs-fp64 error budget is legitimately zero). No performance
+    # is lost — SDPA has nothing to fuse over one key.
+    # fp32 stays manual too (dtype gate, see the constants block up top).
+    use_sdpa = (
+        softcap == 0.0
+        and learnable_sink is None
+        and dlse is None
+        and seqlen_k > 1
+        and q.dtype is not torch.float32
+    )
+    # Global varlen diagonal bound for K-slicing — same derivation and same
+    # sync-cost tradeoff as in _lse_forward (key_leftpad cancels out).
+    varlen_shift_bound = None
+    if use_sdpa and varlen and window_right is not None and seqlen_q > 256:
+        sk_end = (
+            seqused_k.to(torch.long)
+            if seqused_k is not None
+            else torch.tensor(seqlen_k, device=device)
+        )
+        sq_eff = (
+            seqused_q.to(torch.long)
+            if seqused_q is not None
+            else torch.tensor(seqlen_q, device=device)
+        )
+        varlen_shift_bound = int((sk_end - sq_eff).max())
+    q_chunk = q_chunk_size
+    if use_sdpa:
+        # Keep one recompute chunk's score block bounded (SDPA's MPS backward
+        # materializes (b, h, n, w); past INT_MAX elements it hard-fails).
+        q_chunk = min(
+            q_chunk_size,
+            max(16, _SDPA_BWD_CHUNK_ELEMENTS // max(1, batch * nheads_q * seqlen_k)),
+        )
+
+    k_leaf = k.detach().float().requires_grad_()
+    v_leaf = v.detach().float().requires_grad_()
+    dq_chunks = []
+    dk_acc = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
+    dv_acc = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
+    for row_start in range(0, seqlen_q, q_chunk):
+        row_end = min(row_start + q_chunk, seqlen_q)
+        n = row_end - row_start
+        dout_chunk = dout[:, row_start:row_end]
+        if use_sdpa:
+            # Visible K range for this chunk (same arithmetic as
+            # _lse_forward); slicing the leaf keeps autograd exact — the
+            # returned dk/dv are full-shaped with zeros outside the slice.
+            if varlen:
+                lo, hi = 0, seqlen_k
+                if varlen_shift_bound is not None:
+                    hi = max(
+                        0, min(seqlen_k, (row_end - 1) + varlen_shift_bound + window_right + 1)
+                    )
+            else:
+                hi = (
+                    seqlen_k
+                    if window_right is None
+                    else max(0, min(seqlen_k, (row_end - 1) + shift + window_right + 1))
+                )
+                lo = (
+                    0
+                    if window_left is None
+                    else max(0, min(seqlen_k, row_start + shift - window_left))
+                )
+            if hi <= lo:
+                # Nothing visible for any row of this chunk.
+                dq_chunks.append(torch.zeros((batch, n, nheads_q, head_dim), device=device))
+                continue
+            mask = _build_score_mask(
+                n,
+                hi - lo,
+                window_size,
+                device,
+                row_offset=row_start,
+                seqlen_q_total=seqlen_q,
+                col_offset=lo,
+                seqlen_k_total=seqlen_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                key_leftpad=key_leftpad,
+            )
+            attn_mask = None
+            all_masked = None
+            if mask is not None:
+                if mask.dim() == 2:
+                    mask = mask.unsqueeze(0)  # (1, n, w)
+                all_masked = mask.all(dim=-1, keepdim=True)  # (b-or-1, n-or-1, 1)
+                if alibi_slopes is None:
+                    attn_mask = (~mask | all_masked).unsqueeze(1)  # boolean keep
+                else:
+                    bias = _alibi_bias(
+                        alibi_slopes,
+                        n,
+                        hi - lo,
+                        device,
+                        row_offset=row_start,
+                        seqlen_q_total=seqlen_q,
+                        col_offset=lo,
+                        seqlen_k_total=seqlen_k,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        key_leftpad=key_leftpad,
+                    )  # (1-or-b, h, n, w) fp32
+                    bias = torch.where(
+                        mask.unsqueeze(1), torch.full((), neg_inf, device=device), bias
+                    )
+                    attn_mask = torch.where(
+                        all_masked.unsqueeze(1), torch.zeros((), device=device), bias
+                    )
+            elif alibi_slopes is not None:
+                attn_mask = _alibi_bias(
+                    alibi_slopes,
+                    n,
+                    hi - lo,
+                    device,
+                    row_offset=row_start,
+                    seqlen_q_total=seqlen_q,
+                    col_offset=lo,
+                    seqlen_k_total=seqlen_k,
+                )
+            q_leaf = q[:, row_start:row_end].detach().float().requires_grad_()
+            with torch.enable_grad():
+                out_chunk = _sdpa_bshd(
+                    q_leaf,
+                    k_leaf[:, lo:hi],
+                    v_leaf[:, lo:hi],
+                    attn_mask=attn_mask,
+                    scale=softmax_scale,
+                )
+                if all_masked is not None:
+                    out_chunk = torch.where(
+                        all_masked.unsqueeze(-1),
+                        torch.zeros((), dtype=out_chunk.dtype, device=device),
+                        out_chunk,
+                    )
+            dq_chunk, dk_chunk, dv_chunk = torch.autograd.grad(
+                out_chunk, (q_leaf, k_leaf, v_leaf), dout_chunk.float()
+            )
+        else:
+            q_chunk_leaf = q[:, row_start:row_end].detach().requires_grad_()
+            with torch.enable_grad():
+                out_chunk, lse_chunk = _attention_forward(
+                    q_chunk_leaf,
+                    k_leaf,
+                    v_leaf,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=softcap,
+                    alibi_slopes=alibi_slopes,
+                    learnable_sink=learnable_sink,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    key_leftpad=key_leftpad,
+                    _row_offset=row_start,
+                    _seqlen_q_total=seqlen_q,
+                )
+            outputs = (out_chunk,)
+            grad_outputs = (dout_chunk,)
+            if dlse is not None:
+                outputs = outputs + (lse_chunk,)
+                grad_outputs = grad_outputs + (dlse[:, :, row_start:row_end],)
+            dq_chunk, dk_chunk, dv_chunk = torch.autograd.grad(
+                outputs, (q_chunk_leaf, k_leaf, v_leaf), grad_outputs
+            )
+        dq_chunks.append(dq_chunk)
+        dk_acc += dk_chunk.float()
+        dv_acc += dv_chunk.float()
+    if dq_chunks:
+        dq = torch.cat(dq_chunks, dim=1)
+    else:
+        dq = torch.zeros((batch, 0, nheads_q, head_dim), device=device)
+    return dq.to(q.dtype), dk_acc.to(k.dtype), dv_acc.to(v.dtype)
+
+
 class MPSFlashAttnFunc(torch.autograd.Function):
     """Memory-bounded attention for MPS.
 
-    forward: runs the chunked online-softmax forward under ``no_grad`` — no
-    O(seqlen^2) activations are ever saved (plain autograd over a chunked
-    forward would save every chunk's score block and be right back at
-    O(seqlen^2)).
+    forward (under ``no_grad`` — no O(seqlen^2) activations are ever saved):
 
-    backward: recomputes the attention chunk-by-chunk over Q blocks and
-    differentiates the small, obviously-correct :func:`_attention_forward`
-    per block with ``torch.autograd.grad`` — flash-attention recomputes in
-    its backward too, and reusing the same core function means there is no
-    second copy of the math to drift. dK/dV are accumulated in fp32.
+    - **split** (Phase 3b, default whenever the flags are mask-shaped):
+      ``out`` from :func:`_sdpa_out` (Apple's fused SDPA — the measured
+      torch-level ceiling) and ``lse`` from the streaming fp32
+      :func:`_lse_forward` pass. Measured 1.2-2.3x faster than the chunked
+      core at every benchmarked shape (the split is never slower — the lse
+      pass alone costs less than the chunked core's fp32 out+lse sweep), so
+      there is no crossover heuristic; ``force_chunked`` pins the old path
+      for tests and benchmarks.
+    - **chunked online-softmax core** for what SDPA cannot express (softcap,
+      ALiBi, learnable_sink) or when the mask budget is exceeded.
+
+    backward: memory-flat Q-chunked recompute via
+    :func:`_attention_backward_chunked` (SDPA-powered per chunk where
+    expressible, the manual differentiable core otherwise). dK/dV are
+    accumulated in fp32 across chunks and rounded to the storage dtype once.
     """
 
     @staticmethod
@@ -489,23 +1055,64 @@ class MPSFlashAttnFunc(torch.autograd.Function):
         key_leftpad=None,
         kv_chunk_size=_KV_CHUNK_SIZE_FWD,
         q_chunk_size=_Q_CHUNK_SIZE_BWD,
+        need_lse=True,
+        force_chunked=False,
     ):
         with torch.no_grad():
-            out, lse = _attention_forward_chunked(
-                q,
-                k,
-                v,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                window_size=window_size,
-                softcap=softcap,
-                alibi_slopes=alibi_slopes,
-                learnable_sink=learnable_sink,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                key_leftpad=key_leftpad,
-                kv_chunk_size=kv_chunk_size,
+            out = None
+            splittable = (
+                not force_chunked
+                and q.dtype is not torch.float32  # fp32 dtype gate, see top of file
+                and softcap == 0.0
+                and alibi_slopes is None
+                and learnable_sink is None
+                and q.shape[1] > 0
+                and k.shape[1] > 0
             )
+            if splittable:
+                out = _sdpa_out(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    key_leftpad=key_leftpad,
+                )
+            if out is not None:
+                if need_lse:
+                    lse = _lse_forward(
+                        q,
+                        k,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                        window_size=window_size,
+                        seqused_q=seqused_q,
+                        seqused_k=seqused_k,
+                        key_leftpad=key_leftpad,
+                    )
+                else:
+                    # The caller discards lse; skip the pass entirely. An
+                    # autograd.Function output must still be a tensor.
+                    lse = torch.empty(0, dtype=torch.float32, device=q.device)
+            else:
+                out, lse = _attention_forward_chunked(
+                    q,
+                    k,
+                    v,
+                    softmax_scale=softmax_scale,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=softcap,
+                    alibi_slopes=alibi_slopes,
+                    learnable_sink=learnable_sink,
+                    seqused_q=seqused_q,
+                    seqused_k=seqused_k,
+                    key_leftpad=key_leftpad,
+                    kv_chunk_size=kv_chunk_size,
+                )
         ctx.save_for_backward(
             q, k, v, alibi_slopes, learnable_sink, seqused_q, seqused_k, key_leftpad
         )
@@ -520,69 +1127,28 @@ class MPSFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, dlse):
         q, k, v, alibi_slopes, learnable_sink, seqused_q, seqused_k, key_leftpad = ctx.saved_tensors
-        seqlen_q = q.shape[1]
-        q_chunk_size = ctx.q_chunk_size
         if dout is None:  # only lse was used downstream
             dout = q.new_zeros((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]))
-        # fp32 leaves (fp16/bf16 -> fp32 is exact, so the recomputed forward is
-        # bit-identical): autograd.grad then returns per-chunk dK/dV in fp32,
-        # so the cross-chunk accumulation below is exact and dK/dV get rounded
-        # to the storage dtype exactly once, at the end. With low-precision
-        # leaves each chunk's gradient would be rounded to fp16/bf16 *before*
-        # accumulation, leaking chunk-boundary rounding into multi-chunk sums.
-        k_leaf = k.detach().float().requires_grad_()
-        v_leaf = v.detach().float().requires_grad_()
-        dq_chunks = []
-        dk_acc = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
-        dv_acc = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
-        for row_start in range(0, seqlen_q, q_chunk_size):
-            row_end = min(row_start + q_chunk_size, seqlen_q)
-            q_chunk = q[:, row_start:row_end].detach().requires_grad_()
-            with torch.enable_grad():
-                out_chunk, lse_chunk = _attention_forward(
-                    q_chunk,
-                    k_leaf,
-                    v_leaf,
-                    softmax_scale=ctx.softmax_scale,
-                    causal=ctx.causal,
-                    window_size=ctx.window_size,
-                    softcap=ctx.softcap,
-                    alibi_slopes=alibi_slopes,
-                    learnable_sink=learnable_sink,
-                    seqused_q=seqused_q,
-                    seqused_k=seqused_k,
-                    key_leftpad=key_leftpad,
-                    _row_offset=row_start,
-                    _seqlen_q_total=seqlen_q,
-                )
-            outputs = (out_chunk,)
-            grad_outputs = (dout[:, row_start:row_end],)
-            if dlse is not None:
-                outputs = outputs + (lse_chunk,)
-                grad_outputs = grad_outputs + (dlse[:, :, row_start:row_end],)
-            dq_chunk, dk_chunk, dv_chunk = torch.autograd.grad(
-                outputs, (q_chunk, k_leaf, v_leaf), grad_outputs
-            )
-            dq_chunks.append(dq_chunk)
-            dk_acc += dk_chunk.float()
-            dv_acc += dv_chunk.float()
-        dq = torch.cat(dq_chunks, dim=1)
-        return (
-            dq,
-            dk_acc.to(k.dtype),
-            dv_acc.to(v.dtype),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+        if dlse is not None and dlse.numel() == 0:
+            dlse = None  # the need_lse=False placeholder output
+        dq, dk, dv = _attention_backward_chunked(
+            dout,
+            dlse,
+            q,
+            k,
+            v,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            softcap=ctx.softcap,
+            alibi_slopes=alibi_slopes,
+            learnable_sink=learnable_sink,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            key_leftpad=key_leftpad,
+            q_chunk_size=ctx.q_chunk_size,
         )
+        return (dq, dk, dv) + (None,) * 13
 
 
 def _sdpa_bshd(
@@ -655,73 +1221,55 @@ def mps_flash_attn_func(
     return_lse: bool = True,
     kv_chunk_size: int = _KV_CHUNK_SIZE_FWD,
     q_chunk_size: int = _Q_CHUNK_SIZE_BWD,
+    _force_chunked: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Memory-bounded MPS attention entry point shared by both seams.
 
-    Returns ``(out, lse)``; ``lse`` is ``None`` when ``return_lse=False`` and
-    an SDPA fast path was taken (SDPA does not expose lse — a fabricated one
-    would be a lie, so none is returned).
+    Returns ``(out, lse)``; ``lse`` is ``None`` when ``return_lse=False``
+    (SDPA does not expose lse and the split path skips the lse pass — a
+    fabricated lse would be a lie, so none is returned).
 
     ``seqused_q`` / ``seqused_k`` / ``key_leftpad`` are optional ``(batch,)``
     int tensors declaring per-batch used lengths for the padded-varlen /
     kv-cache formulation (semantics in :func:`_build_score_mask`). Rows past
     ``seqused_q[i]`` produce ``out = 0`` (and ``lse = -inf``).
 
-    Fast paths (``F.scaled_dot_product_attention``), exact-semantics only:
+    Routing (Phase 3b):
 
-    - dense: no softcap / window / ALiBi / sink, no lse needed, and causal
-      only when ``seqlen_q == seqlen_k`` (SDPA's ``is_causal`` is top-left
-      aligned; flash-attention's causal mask is bottom-right aligned, which
-      differs whenever the seqlens differ).
-    - varlen (any ``seqused``/``leftpad`` given): same flag restrictions, but
-      causal/window and the per-batch bottom-right alignment are expressed
-      through a boolean ``attn_mask`` built by :func:`_build_score_mask` — so
-      any seqlens are fine. Fully-masked rows (padding rows, causal rows with
-      no visible keys) are temporarily unmasked to keep SDPA's softmax
-      NaN-free, then forced to exactly 0 afterwards; their gradients are
-      exactly 0 because the zeroing blocks the upstream gradient.
+    - ``return_lse=False`` + mask-shaped flags (no softcap/ALiBi/sink;
+      causal, local windows and varlen/leftpad are all fine —
+      :func:`_sdpa_out` expresses them as a boolean mask): one differentiable
+      SDPA call, autograd provides the backward. Guarded under grad mode by
+      ``_SDPA_AUTOGRAD_MAX_ELEMENTS``: past it SDPA's own backward would
+      materialize the full (b, h, sq, sk) score matrix — INT_MAX hard-fail
+      at 16k on MPS — so the call routes into :class:`MPSFlashAttnFunc`,
+      whose recompute backward is memory-flat at near-identical speed.
+    - everything else: :class:`MPSFlashAttnFunc` — split forward (SDPA out +
+      streaming fp32 lse) when expressible, chunked online-softmax core
+      otherwise, Q-chunked recompute backward always.
+
+    ``_force_chunked`` pins the chunked core (tests and benchmarks only).
     """
-    plain_flags = (
-        softcap == 0.0
-        and window_size[0] is None
-        and window_size[1] is None
-        and alibi_slopes is None
-        and learnable_sink is None
-    )
-    varlen = seqused_q is not None or seqused_k is not None or key_leftpad is not None
-    if not varlen and not return_lse and plain_flags and (not causal or q.shape[1] == k.shape[1]):
-        out = _sdpa_bshd(q, k, v, is_causal=causal, scale=softmax_scale)
-        return out.contiguous(), None
-    if (
-        varlen
-        and not return_lse
-        and plain_flags
-        and q.shape[0] * q.shape[1] * k.shape[1] <= _SDPA_MASK_MAX_ELEMENTS
-    ):
-        seqlen_q, seqlen_k = q.shape[1], k.shape[1]
-        masked = _build_score_mask(
-            seqlen_q,
-            seqlen_k,
-            (window_size[0], 0) if causal else window_size,
-            q.device,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            key_leftpad=key_leftpad,
+    plain_flags = softcap == 0.0 and alibi_slopes is None and learnable_sink is None
+    if not return_lse and plain_flags and not _force_chunked and q.shape[1] > 0 and k.shape[1] > 0:
+        grad_mode = torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
         )
-        # Fully-masked rows would make SDPA's softmax produce NaN. Unmask
-        # them (their scores then softmax to *something* finite) and force
-        # the output rows to exactly 0 afterwards; torch.where also routes
-        # their upstream gradient to the constant branch, so dq/dk/dv
-        # contributions from these rows are exactly 0.
-        all_masked = masked.all(dim=-1, keepdim=True)  # (b, sq-or-1, 1)
-        keep = ~masked | all_masked
-        out = _sdpa_bshd(q, k, v, attn_mask=keep.unsqueeze(1), scale=softmax_scale)
-        out = torch.where(
-            all_masked.unsqueeze(-1),  # (b, sq-or-1, 1, 1), broadcasts over h and d
-            torch.zeros((), dtype=out.dtype, device=out.device),
-            out,
-        )
-        return out.contiguous(), None
+        score_elements = q.shape[0] * q.shape[2] * q.shape[1] * k.shape[1]
+        if not grad_mode or score_elements <= _SDPA_AUTOGRAD_MAX_ELEMENTS:
+            out = _sdpa_out(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                key_leftpad=key_leftpad,
+            )
+            if out is not None:
+                return out, None
     out, lse = MPSFlashAttnFunc.apply(
         q,
         k,
@@ -737,5 +1285,7 @@ def mps_flash_attn_func(
         key_leftpad,
         kv_chunk_size,
         q_chunk_size,
+        return_lse,
+        _force_chunked,
     )
     return out, (lse if return_lse else None)

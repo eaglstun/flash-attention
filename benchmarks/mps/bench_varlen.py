@@ -24,6 +24,7 @@ from flash_attn.mps.varlen import mps_flash_attn_varlen  # noqa: E402
 
 
 def bench(label, fn, **kw):
+    torch.mps.empty_cache()  # keep one case's transients from starving the next
     times = time_op(fn, **kw)
     med, iqr = median_iqr(times)
     print(f"  {label:56s} {med * 1e3:9.2f} ms (iqr {iqr * 1e3:.2f}, n={len(times)})")
